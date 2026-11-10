@@ -233,6 +233,7 @@ add_executable(gow_rt
   runtime/rt_main.c
   runtime/rt_mpeg.c
   runtime/rt_prof.c
+  runtime/rt_ra.c
   runtime/rt_sas.c
   runtime/rt_savedata.c
   runtime/rt_thread.c
@@ -243,6 +244,22 @@ add_executable(gow_rt
 set_target_properties(gow_rt PROPERTIES OUTPUT_NAME "gow_rt_${GAME}" C_STANDARD 11)
 target_include_directories(gow_rt PRIVATE runtime "${GEN_DIR}")
 target_link_libraries(gow_rt PRIVATE chdr-static at3_standalone openh264_dec libkirk)
+
+# RetroAchievements (Linux, rt_ra.c): rcheevos (MIT) release v12.5.0, its runtime and client without the disc hashers
+# (the port hashes the disc itself); the network goes through the system's libcurl, loaded at run time
+if(UNIX AND NOT APPLE AND NOT GOW_TOOLS_ONLY)
+  gow_fetch_archive(rcheevos RetroAchievements/rcheevos 1433173220a7eaede6a9ed7a18e94117be1821e0
+    da635153d2dab228f3a3ef672bae56a7a6e5f57f1aacd420133521c5d3768cec)
+  set(RC_DIR "${GOW_DEPS_DIR}/rcheevos-1433173220a7eaede6a9ed7a18e94117be1821e0")
+  file(GLOB RC_SOURCES "${RC_DIR}/src/rcheevos/*.c" "${RC_DIR}/src/rapi/*.c")
+  add_library(rcheevos STATIC ${RC_SOURCES} "${RC_DIR}/src/rc_client.c" "${RC_DIR}/src/rc_compat.c"
+    "${RC_DIR}/src/rc_util.c" "${RC_DIR}/src/rc_version.c" "${RC_DIR}/src/rhash/md5.c")
+  target_include_directories(rcheevos PUBLIC "${RC_DIR}/include" PRIVATE "${RC_DIR}/src")
+  target_compile_options(rcheevos PRIVATE -O2 -w)
+  target_link_libraries(gow_rt PRIVATE rcheevos)
+  target_include_directories(gow_rt PRIVATE "${RC_DIR}/src/rhash")
+  target_compile_definitions(gow_rt PRIVATE GOW_HAVE_RCHEEVOS)
+endif()
 
 # "Smooth HUD" (Linux): PPSSPP's xBRZ (GPL-3.0) from tag v1.20.4, checked by SHA-256, scales the 2D
 # pictures drawn on the screen (rt_gpu.c, rt_xbrz.cpp)
@@ -279,6 +296,12 @@ if(GOW_WINDOW AND UNIX AND NOT APPLE)
   set_target_properties(gow_menu PROPERTIES C_STANDARD 11)
   target_include_directories(gow_menu PRIVATE runtime "${STB_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
   target_link_libraries(gow_menu PRIVATE SDL3::SDL3-static)
+  # RetroAchievements' notices in the game (rt_toast.c), in the same font
+  if(TARGET rcheevos)
+    target_sources(gow_rt PRIVATE runtime/rt_toast.c)
+    target_include_directories(gow_rt PRIVATE "${STB_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+    target_compile_definitions(gow_rt PRIVATE GOW_HAVE_TOAST)
+  endif()
 endif()
 
 if(MSVC)

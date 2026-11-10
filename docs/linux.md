@@ -38,7 +38,7 @@ python3 -I tools/launcher.pyw --menu             # el selector con los juegos co
 python3 -I tools/launcher.pyw --add-to-steam     # con Steam cerrado: agrega "God of War PSP", que abre el selector
 ```
 
-`--play JUEGO` abre un juego directo. Las partidas y las opciones van en `~/.local/share/gow-psp/<juego>/`. Si tenés los dos discos de un juego, el selector muestra el de EE. UU.; para el europeo, poné `"prefer": {"coo": "coo_eu"}` en `build/launcher.json`. Toma el idioma del sistema si es inglés, francés o español. El acceso de Steam y los juegos corren fuera del contenedor, con el Python del sistema.
+`--play JUEGO` abre un juego directo. Las partidas y las opciones van en `~/.local/share/gow-psp/<juego>/`. Si tenés los dos discos de un juego, el selector abre el europeo, que tiene logros; para el de EE. UU., poné `"prefer": {"gos": "gos"}` en `build/launcher.json` (`coo` para Chains). Con un solo disco abre ese. Toma el idioma del sistema si es inglés, francés o español. El acceso de Steam y los juegos corren fuera del contenedor, con el Python del sistema.
 
 ## Compilar
 
@@ -116,7 +116,7 @@ build/linux_coo/gow_menu --entry "Chains of Olympus" IMAGEN.png SCRIPT_DEL_JUEGO
                          --entry "Ghost of Sparta" IMAGEN.png SCRIPT_DEL_JUEGO --settings AJUSTES_GOS.ini
 ```
 
-Stick o cruceta para elegir, A para jugar, B para salir. Al cerrar el juego vuelve al selector. Y abre las opciones del juego elegido, las mismas del menú del juego: arriba y abajo eligen, izquierda y derecha cambian el valor, B vuelve. `--settings` tiene que ser el mismo archivo que recibe el juego. El selector escribe solo las opciones que cambiaste; las demás siguen con los valores del script. La imagen sale de tu disco:
+Stick o cruceta para elegir, A para jugar, B para salir. Al cerrar el juego vuelve al selector. X muestra los logros del juego, si tiene (ver "Logros"). Y abre las opciones del juego elegido, las mismas del menú del juego: arriba y abajo eligen, izquierda y derecha cambian el valor, B vuelve. `--settings` tiene que ser el mismo archivo que recibe el juego. El selector escribe solo las opciones que cambiaste; las demás siguen con los valores del script. La imagen sale de tu disco:
 
 ```bash
 build/linux_tools/gow_disc --disc TU_DISCO.iso --extract disc0:/PSP_GAME/PIC1.PNG IMAGEN.png
@@ -127,6 +127,18 @@ build/linux_tools/gow_disc --disc TU_DISCO.iso --extract disc0:/PSP_GAME/PIC1.PN
 **Back + clic del stick izquierdo,** o F10. Resolución, FPS, V-Sync, MSAA, FXAA, anisotrópico, nitidez, aspecto, CRT, suavizar HUD y pantalla completa. "Suavizar HUD" agranda los iconos, el texto y las barras con xBRZ para que no se vean los píxeles a resoluciones altas. Se guardan en el archivo de `--settings`. MSAA se aplica al volver a abrir el juego; lo demás, al cerrar el menú.
 
 Salir del juego: Back + Start durante 2 segundos, o desde este menú.
+
+### Logros (RetroAchievements)
+
+Solo en modo normal (softcore) y solo con los **discos europeos**, que son los que RetroAchievements tiene registrados (los de EE. UU. avisan que no tienen logros). Hace falta una cuenta de [RetroAchievements](https://retroachievements.org) y la `libcurl` del sistema, que Bazzite y SteamOS traen; sin ella o sin internet el juego abre igual.
+
+```bash
+python3 -I tools/ra_login.py   # pide usuario y contraseña; guarda solo el token en ~/.local/share/gow-psp/retroachievements.ini
+```
+
+Con ese archivo, el launcher abre los juegos con `--retroachievements`. Al ganar un logro aparece un aviso arriba, con su ícono, sin pausar. La lista (ganados y pendientes) está en el menú del juego, en "Logros", y en el selector con X. Los íconos se bajan una vez a `~/.local/share/gow-psp/ra_images/`.
+
+Con `--warp`, `--load-level`, `--god` o una repetición con `--input`, o con `--ra-spectator`, el juego solo mira: evalúa los logros pero no envía nada.
 
 ## Problemas conocidos
 

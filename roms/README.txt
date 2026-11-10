@@ -13,7 +13,8 @@ Discs that work:
   Ghost of Sparta     UCUS98737 (USA, English, French and Spanish)
                       UCES01401 (Europe, with Spanish)
 
-With both discs of a game, the game picker lets you choose which one to play.
+With both discs of a game, the game picker opens the European one, the one RetroAchievements knows. With one
+disc, it opens that one.
 
 Making the backup: on a PSP with custom firmware, its VSH menu ("USB Device: UMD Disc") shows the UMD as an
 .iso over USB; copy it as it is. For a smaller file, a .chd made with "chdman createdvd" works too.

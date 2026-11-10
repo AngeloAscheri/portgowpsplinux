@@ -451,6 +451,9 @@ def play_command(cfg, game):
         cmd += ["--confirm", "circle"]
     if LINUX:  # the in-game options menu keeps its choices per game
         cmd += ["--settings", str(DATA_HOME / game / "settings.ini")]
+        ra = DATA_HOME / "retroachievements.ini"  # signed in with tools/ra_login.py: achievements (softcore)
+        if ra.is_file():
+            cmd += ["--retroachievements", str(ra)]
     return cmd
 
 
@@ -639,7 +642,9 @@ def scan_folder(folder, out=print):
     ids = {g["id"]: k for k, g in GAMES.items()}
     found = {}
     base = Path(folder)
-    cands = [p for pat in ("*.chd", "*.iso", "*/*.chd", "*/*.iso") for p in sorted(base.glob(pat), key=lambda q: str(q).lower())]
+    # by suffix in any case: Linux tells GAME.ISO from game.iso, and a glob for "*.iso" would miss it there
+    cands = [p for pat in ("*", "*/*") for ext in (".chd", ".iso")
+             for p in sorted(base.glob(pat), key=lambda q: str(q).lower()) if p.suffix.lower() == ext and p.is_file()]
     for f in cands:
         try:
             r = subprocess.run([str(disc_tool()), "--disc", str(f), "--id"], capture_output=True, text=True, timeout=120,
@@ -679,11 +684,12 @@ MENU_TITLES = {"coo": "Chains of Olympus", "gos": "Ghost of Sparta"}
 
 
 def menu_games(cfg):
-    """Linux: per game, the disc to show in the picker: the one chosen in cfg["prefer"] (e.g. {"coo": "coo_eu"} for
-    Spanish), else the US one, else the European one; the first of those that is built and has its disc."""
+    """Linux: per game, the disc to show in the picker: the one chosen in cfg["prefer"] (e.g. {"gos": "gos"} for the
+    US one), else the European one (RetroAchievements knows only those), else the US one; the first of those that is
+    built and has its disc."""
     out = []
     for base in MENU_TITLES:
-        keys = [base, base + "_eu"]
+        keys = [base + "_eu", base]
         pref = (cfg.get("prefer") or {}).get(base)
         order = ([pref] if pref in keys else []) + [k for k in keys if k != pref]
         ready = [k for k in order if exe_path(k).exists() and Path(cfg["disc"].get(k, "") or "/").is_file()]
@@ -710,6 +716,7 @@ def menu_command(cfg):
         else:
             art = ""
         cmd += ["--entry", MENU_TITLES[base], str(art), str(script), "--settings", str(DATA_HOME / key / "settings.ini")]
+    cmd += ["--ra-ini", str(DATA_HOME / "retroachievements.ini")]  # Start: sign in to RetroAchievements (or out)
     return cmd
 
 

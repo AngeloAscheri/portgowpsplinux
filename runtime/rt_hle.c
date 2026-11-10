@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "rt_frames.h"
+#include "rt_ra.h"
 #include "rt_ge.h"
 #include "rt_host.h"
 #include "rt_kernel.h"
@@ -139,6 +140,9 @@ static void hle_DisplaySetFrameBuf(RtCtx *c) {
     if (rt_fast_forward && g_frames + 1 == rt_fast_forward) rt_log("[display] fast-forward over: drawing from frame %u\n", rt_fast_forward);
     rt_frames_present(g_frames, k_now, A0, A1, A2);
     int closed = rt_host_present(g_frames, A0, A1, A2);
+#ifdef __linux__
+    rt_ra_frame(k_now);  /* RetroAchievements: 60 times a second of game time */
+#endif
     rt_frames_after_present(g_frames, A0, A1, A2);
     ge_memory_changed();  /* the CPU may change textures before the next frame */
     if (closed) k_stop(RT_ABORT_HLE, 0, (uint32_t)g_frames, "window closed");

@@ -39,6 +39,9 @@
 #include "rt_frames.h"
 #include "rt_gpu.h"
 #include "rt_host.h"
+#ifdef GOW_HAVE_TOAST
+#include "rt_toast.h"
+#endif
 
 GpuOptions rt_gpu_opt;
 
@@ -173,6 +176,12 @@ static Pipe g_pipes[MAX_PIPELINES];
 static int g_npipes;
 static struct { SDL_GPUTextureFormat fmt; int samples; SDL_GPUGraphicsPipeline *p; } g_ppipes[8];
 static int g_nppipes;
+#ifdef GOW_HAVE_TOAST
+/* >= 0: post_pass blends over what the target holds with this opacity (on-screen notices, rt_toast.c) */
+static float g_post_alpha = -1.0f;
+static struct { SDL_GPUTextureFormat fmt; SDL_GPUGraphicsPipeline *p; } g_bpipes[4];
+static int g_nbpipes;
+#endif
 static TexEntry *g_tex;
 static size_t g_tex_count;
 static GpuVertex *g_verts;
@@ -896,6 +905,37 @@ static int pipeline(uint64_t key) {
 
 /* the full-screen passes of post.hlsl, for a colour format and sample count */
 static SDL_GPUGraphicsPipeline *post_pipeline(SDL_GPUTextureFormat fmt, SDL_GPUSampleCount sc) {
+#ifdef GOW_HAVE_TOAST
+    if (g_post_alpha >= 0.0f) {  /* the window's format, one sample: colour = source x alpha + target x (1 - alpha) */
+        for (int i = 0; i < g_nbpipes; i++) if (g_bpipes[i].fmt == fmt) return g_bpipes[i].p;
+        if (g_nbpipes == (int)(sizeof(g_bpipes) / sizeof(g_bpipes[0]))) return NULL;
+        SDL_GPUColorTargetDescription bt;
+        memset(&bt, 0, sizeof(bt));
+        bt.format = fmt;
+        bt.blend_state.enable_blend = true;
+        bt.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_CONSTANT_COLOR;
+        bt.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_CONSTANT_COLOR;
+        bt.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+        bt.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+        bt.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+        bt.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+        SDL_GPUGraphicsPipelineCreateInfo bi;
+        memset(&bi, 0, sizeof(bi));
+        bi.vertex_shader = g_post_vs;
+        bi.fragment_shader = g_post_fs;
+        bi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        bi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+        bi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+        bi.multisample_state.sample_count = sc;
+        bi.target_info.color_target_descriptions = &bt;
+        bi.target_info.num_color_targets = 1;
+        SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(g_dev, &bi);
+        if (!p) fprintf(stderr, "[gpu] blended post pipeline: %s\n", SDL_GetError());
+        g_bpipes[g_nbpipes].fmt = fmt;
+        g_bpipes[g_nbpipes++].p = p;
+        return p;
+    }
+#endif
     for (int i = 0; i < g_nppipes; i++) if (g_ppipes[i].fmt == fmt && g_ppipes[i].samples == (int)sc) return g_ppipes[i].p;
     if (g_nppipes == (int)(sizeof(g_ppipes) / sizeof(g_ppipes[0]))) return NULL;
     SDL_GPUColorTargetDescription ct;
@@ -933,6 +973,12 @@ static void post_pass(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *dst, SDL_GPUTex
     ci.clear_color.a = 1.0f;
     SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &ci, 1, NULL);
     SDL_BindGPUGraphicsPipeline(rp, p);
+#ifdef GOW_HAVE_TOAST
+    if (g_post_alpha >= 0.0f) {
+        SDL_FColor k = { g_post_alpha, g_post_alpha, g_post_alpha, g_post_alpha };
+        SDL_SetGPUBlendConstants(rp, k);
+    }
+#endif
     SDL_SetGPUViewport(rp, vp);
     if (scissor) SDL_SetGPUScissor(rp, scissor);
     u->size[0] = (float)tw; u->size[1] = (float)th; u->size[2] = 1.0f / tw; u->size[3] = 1.0f / th;
@@ -2108,6 +2154,52 @@ static void menu_overlay(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *sc, Uint32 s
     post_pass(cmd, sc, g_swfmt, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_LOADOP_LOAD, &vp, NULL, g_menu_tex, g_menu_w, g_menu_h, &u, 0);
 }
 
+#ifdef GOW_HAVE_TOAST
+/* RetroAchievements' notices (rt_toast.c): top centre, uploaded when they change, faded with the blend constant */
+static SDL_GPUTexture *g_toast_tex;
+static int g_toast_w, g_toast_h;
+static unsigned g_toast_serial;
+
+static void toast_overlay(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *sc, Uint32 sw, Uint32 sh) {
+    int w = 0, h = 0;
+    float a = 0;
+    unsigned serial = 0;
+    const void *px = rt_toast_frame((int)sh, &w, &h, &a, &serial);
+    if (!px || a <= 0.0f || w > (int)sw) return;
+    if (!g_toast_tex || serial != g_toast_serial) {
+        if (g_toast_tex && (w != g_toast_w || h != g_toast_h)) { SDL_ReleaseGPUTexture(g_dev, g_toast_tex); g_toast_tex = NULL; }
+        if (!g_toast_tex) g_toast_tex = make_texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, SDL_GPU_TEXTUREUSAGE_SAMPLER, w, h, 1, SDL_GPU_SAMPLECOUNT_1);
+        SDL_GPUTransferBufferCreateInfo ti = { SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, (Uint32)w * (Uint32)h * 4, 0 };
+        SDL_GPUTransferBuffer *tb = g_toast_tex ? SDL_CreateGPUTransferBuffer(g_dev, &ti) : NULL;
+        if (!tb) return;
+        void *dst = SDL_MapGPUTransferBuffer(g_dev, tb, false);
+        if (!dst) { SDL_ReleaseGPUTransferBuffer(g_dev, tb); return; }
+        memcpy(dst, px, (size_t)w * h * 4);
+        SDL_UnmapGPUTransferBuffer(g_dev, tb);
+        SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+        SDL_GPUTextureTransferInfo src = { tb, 0, (Uint32)w, (Uint32)h };
+        SDL_GPUTextureRegion r;
+        memset(&r, 0, sizeof(r));
+        r.texture = g_toast_tex; r.w = (Uint32)w; r.h = (Uint32)h; r.d = 1;
+        SDL_UploadToGPUTexture(cp, &src, &r, false);
+        SDL_EndGPUCopyPass(cp);
+        SDL_ReleaseGPUTransferBuffer(g_dev, tb);
+        g_toast_w = w; g_toast_h = h; g_toast_serial = serial;
+    }
+    PostU u;
+    memset(&u, 0, sizeof(u));
+    u.src[2] = (float)w; u.src[3] = (float)h;
+    u.mode[0] = P_PRESENT;
+    u.mode[1] = 1;
+    u.mode[2] = (uint32_t)g_hdr_out;
+    u.p0[0] = g_paper; u.p0[1] = g_peak; u.p0[2] = 0.55f;
+    SDL_GPUViewport vp = { floorf(((float)sw - (float)w) / 2), floorf((float)sh * 0.035f), (float)w, (float)h, 0.0f, 1.0f };
+    g_post_alpha = a;
+    post_pass(cmd, sc, g_swfmt, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_LOADOP_LOAD, &vp, NULL, g_toast_tex, w, h, &u, 0);
+    g_post_alpha = -1.0f;
+}
+#endif
+
 /* The displayed framebuffer into the window: FXAA and sharpening at the internal resolution
  * (when on), then scaled into the window, letterboxed, as SDR or HDR. */
 static void draw_to_window(SDL_GPUCommandBuffer *cmd, int t, int x, int y) {
@@ -2153,6 +2245,9 @@ static void draw_to_window(SDL_GPUCommandBuffer *cmd, int t, int x, int y) {
     post_pass(cmd, sc, g_swfmt, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_LOADOP_CLEAR, &vp, NULL, src, tw, th, &u, !rt_gpu_opt.nearest);
     if (rt_gpu_opt.show_fps) fps_overlay(cmd, sc);
     if (rt_gpu_opt.show_input) input_overlay(cmd, sc, sh);
+#ifdef GOW_HAVE_TOAST
+    toast_overlay(cmd, sc, sw, sh);
+#endif
     menu_overlay(cmd, sc, sw, sh);
 }
 

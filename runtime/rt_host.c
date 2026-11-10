@@ -36,6 +36,7 @@
 #include "rt_host.h"
 #include "rt_kernel.h"
 #include "rt_settings.h"
+#include "rt_ra.h"
 
 #define DISP_W 480
 #define DISP_H 272
@@ -617,7 +618,15 @@ static const float ASPECT_F[] = { 0.0f, 21.0f / 9.0f, 32.0f / 9.0f, 4.0f / 3.0f 
 typedef struct { const char *label, *key; int *v; const int *vals; int n; const char *const *names; } MenuRow;
 #define ROW(label, key, field, vals, names) { label, key, &g_set.field, vals, (int)(sizeof(vals) / sizeof(vals[0])), names },
 static const MenuRow MENU_ROWS[] = { RT_SETTINGS_ROWS(ROW) };
+#ifdef __linux__
+/* MENU_ACH: RetroAchievements' list, only while a set is loaded (rt_ra.c) */
+enum { MENU_NROWS = (int)(sizeof(MENU_ROWS) / sizeof(MENU_ROWS[0])), MENU_ACH = MENU_NROWS, MENU_BACK, MENU_QUIT, MENU_NITEMS };
+static int g_ach_item;  /* MENU_ACH shown: "Logros (have of n)" */
+static char g_ach_label[48];
+static int item_shown(int i) { return i != MENU_ACH || g_ach_item; }
+#else
 enum { MENU_NROWS = (int)(sizeof(MENU_ROWS) / sizeof(MENU_ROWS[0])), MENU_BACK = MENU_NROWS, MENU_QUIT, MENU_NITEMS };
+#endif
 
 static void settings_from_options(void) {
     const GpuOptions *o = &rt_gpu_opt;
@@ -706,8 +715,11 @@ static void menu_draw(SDL_Renderer *r, int sel) {
     SDL_RenderClear(r);
     SDL_SetRenderDrawColor(r, 233, 214, 164, 255);
     menu_text(r, (MENU_W - 8 * 8) / 2.0f, 12, "OPCIONES");
-    for (int i = 0; i < MENU_NITEMS; i++) {
-        float y = 32.0f + (float)i * 16.0f + (i >= MENU_NROWS ? 6.0f : 0.0f);
+    for (int i = 0, slot = 0; i < MENU_NITEMS; i++, slot++) {
+#ifdef __linux__
+        if (!item_shown(i)) { slot--; continue; }
+#endif
+        float y = 32.0f + (float)slot * 16.0f + (i >= MENU_NROWS ? 6.0f : 0.0f);
         if (i == sel) {
             SDL_FRect bar = { 12, y - 4, MENU_W - 24, 16 };
             SDL_SetRenderDrawColor(r, 90, 70, 36, 255);
@@ -715,6 +727,9 @@ static void menu_draw(SDL_Renderer *r, int sel) {
         }
         Uint8 c = i == sel ? 255 : 190;
         SDL_SetRenderDrawColor(r, c, c, c, 255);
+#ifdef __linux__
+        if (i == MENU_ACH) { menu_text(r, 24, y, g_ach_label); continue; }
+#endif
         if (i == MENU_BACK) { menu_text(r, 24, y, "Volver al juego"); continue; }
         if (i == MENU_QUIT) { menu_text(r, 24, y, "Salir del juego"); continue; }
         const MenuRow *m = &MENU_ROWS[i];
@@ -746,6 +761,120 @@ static int twin_press(int code, SDL_JoystickID dev) {
 }
 #endif
 
+#ifdef __linux__
+/* --- the achievements page of the options menu (RetroAchievements, rt_ra.c) --------------------------------------
+ * The loaded set, unlocked first, with each icon (dimmed while locked). SDL's debug font is ASCII: accents are
+ * dropped (a for á) and other characters left out. */
+#define ACH_ROW_H 30
+#define ACH_ROWS 7
+static RtRaSet g_ach;
+static SDL_Texture **g_ach_icon;
+static int g_ach_sel, g_ach_top, g_ach_open_test;
+
+/* s in ASCII, at most max characters ("..." when cut) */
+static void ach_ascii(const char *s, char *out, int max) {
+    static const char latin1[] = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+    int n = 0, cut = 0;
+    char tmp[256];
+    while (*s && n < (int)sizeof(tmp) - 1) {
+        unsigned char c = (unsigned char)*s;
+        uint32_t u = c;
+        int len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (len > 1) { u = c & (0xFF >> (len + 1)); for (int k = 1; k < len && s[k]; k++) u = u << 6 | ((unsigned char)s[k] & 0x3F); }
+        for (int k = 0; k < len && *s; k++) s++;
+        char a = u < 0x80 ? (char)u : u >= 0xC0 && u <= 0xFF ? latin1[u - 0xC0] : u == 0x2018 || u == 0x2019 ? '\'' :
+                 u == 0x201C || u == 0x201D ? '"' : u == 0x2013 || u == 0x2014 ? '-' : 0;
+        if (a && (a != ' ' || (n && tmp[n - 1] != ' '))) tmp[n++] = a;
+    }
+    tmp[n] = 0;
+    if (n > max) { cut = 1; n = max > 3 ? max - 3 : 0; while (n && tmp[n - 1] == ' ') n--; }
+    memcpy(out, tmp, (size_t)n);
+    if (cut) memcpy(out + n, "...", 3), n += 3;
+    out[n] = 0;
+}
+
+static void ach_close(void) {
+    for (int i = 0; g_ach_icon && i < g_ach.n; i++) if (g_ach_icon[i]) SDL_DestroyTexture(g_ach_icon[i]);
+    free(g_ach_icon);
+    g_ach_icon = NULL;
+    rt_ra_set_free(&g_ach);
+}
+
+static void ach_open(SDL_Renderer *r) {
+    ach_close();
+    rt_ra_set(&g_ach);
+    g_ach_sel = g_ach_top = 0;
+    g_ach_icon = g_ach.n ? (SDL_Texture **)calloc((size_t)g_ach.n, sizeof(*g_ach_icon)) : NULL;
+    int icons = 0;
+    for (int i = 0; g_ach_icon && i < g_ach.n; i++) {
+        SDL_Surface *png = g_ach.e[i].icon[0] ? SDL_LoadPNG(g_ach.e[i].icon) : NULL;
+        if (!png) continue;
+        g_ach_icon[i] = SDL_CreateTextureFromSurface(r, png);
+        SDL_DestroySurface(png);
+        if (!g_ach_icon[i]) continue;
+        icons++;
+        SDL_SetTextureScaleMode(g_ach_icon[i], SDL_SCALEMODE_LINEAR);
+        if (!g_ach.e[i].unlocked) SDL_SetTextureColorMod(g_ach_icon[i], 90, 90, 90);
+    }
+    printf("[host] achievements page: %d of %d unlocked, %d icons\n", g_ach.have, g_ach.n, icons);
+}
+
+static void ach_move(int d) {
+    if (!g_ach.n) return;
+    g_ach_sel += d;
+    if (g_ach_sel < 0) g_ach_sel = 0;
+    if (g_ach_sel >= g_ach.n) g_ach_sel = g_ach.n - 1;
+    if (g_ach_sel < g_ach_top) g_ach_top = g_ach_sel;
+    if (g_ach_sel >= g_ach_top + ACH_ROWS) g_ach_top = g_ach_sel - ACH_ROWS + 1;
+}
+
+static void ach_draw(SDL_Renderer *r) {
+    char line[96];
+    SDL_SetRenderDrawColor(r, 14, 12, 10, 235);
+    SDL_RenderClear(r);
+    SDL_SetRenderDrawColor(r, 233, 214, 164, 255);
+    menu_text(r, (MENU_W - 6 * 8) / 2.0f, 10, "LOGROS");
+    SDL_SetRenderDrawColor(r, 190, 190, 190, 255);
+    ach_ascii(g_ach.game, line, MENU_W / 8 - 4);
+    menu_text(r, (MENU_W - 8.0f * (float)strlen(line)) / 2.0f, 23, line);
+    if (!g_ach.n) {
+        menu_text(r, 24, 60, "No hay logros cargados.");
+    } else {
+        snprintf(line, sizeof(line), "%d de %d logros   %u de %u puntos", g_ach.have, g_ach.n, g_ach.pts_have, g_ach.pts);
+        SDL_SetRenderDrawColor(r, 170, 160, 140, 255);
+        menu_text(r, (MENU_W - 8.0f * (float)strlen(line)) / 2.0f, 35, line);
+    }
+    for (int i = g_ach_top; i < g_ach.n && i < g_ach_top + ACH_ROWS; i++) {
+        const RtRaEntry *e = &g_ach.e[i];
+        float y = 50.0f + (float)(i - g_ach_top) * ACH_ROW_H;
+        if (i == g_ach_sel) {
+            SDL_FRect bar = { 8, y - 3, MENU_W - 16, ACH_ROW_H - 2 };
+            SDL_SetRenderDrawColor(r, 90, 70, 36, 255);
+            SDL_RenderFillRect(r, &bar);
+        }
+        SDL_FRect ir = { 14, y, 24, 24 };
+        if (g_ach_icon && g_ach_icon[i]) SDL_RenderTexture(r, g_ach_icon[i], NULL, &ir);
+        else { SDL_SetRenderDrawColor(r, 40, 32, 24, 255); SDL_RenderFillRect(r, &ir); }
+        char pts[16];
+        snprintf(pts, sizeof(pts), "%u", e->points);
+        int title_max = (MENU_W - 46 - 14) / 8 - (int)strlen(pts) - 1;
+        ach_ascii(e->title, line, title_max);
+        if (e->unlocked) SDL_SetRenderDrawColor(r, 233, 214, 164, 255);
+        else SDL_SetRenderDrawColor(r, i == g_ach_sel ? 220 : 175, i == g_ach_sel ? 220 : 175, i == g_ach_sel ? 220 : 175, 255);
+        menu_text(r, 46, y + 2, line);
+        menu_text(r, (float)(MENU_W - 14) - 8.0f * (float)strlen(pts), y + 2, pts);
+        SDL_SetRenderDrawColor(r, 140, 132, 118, 255);
+        ach_ascii(e->desc, line, (MENU_W - 46 - 14) / 8);
+        menu_text(r, 46, y + 14, line);
+    }
+    SDL_SetRenderDrawColor(r, 170, 160, 140, 255);
+    if (g_ach_top > 0) menu_text(r, MENU_W - 16, 40, "^");
+    if (g_ach_top + ACH_ROWS < g_ach.n) menu_text(r, MENU_W - 16, 50.0f + ACH_ROWS * ACH_ROW_H - 4, "v");
+    menu_text(r, 24, MENU_H - 16, "Arriba/abajo: mover   B: volver");
+    SDL_FlushRenderer(r);
+}
+#endif
+
 static void options_menu(int test_ms) {
     printf("[host] options menu opened\n");
     rt_audio_pause(1);
@@ -756,19 +885,37 @@ static void options_menu(int test_ms) {
     g_set.fullscreen = g_fullscreen;
     Settings before = g_set;
     Uint64 end = SDL_GetTicks() + (Uint64)test_ms;
-    int sel = 0, open = r != NULL, stick_x = 0, stick_y = 0;
+    int sel = 0, open = r != NULL, stick_x = 0, stick_y = 0, page = 0;
+#ifdef __linux__
+    {
+        RtRaSet set;
+        g_ach_item = rt_ra_set(&set);
+        snprintf(g_ach_label, sizeof(g_ach_label), "Logros (%d de %d)", set.have, set.n);
+        rt_ra_set_free(&set);
+        if (g_ach_open_test && r) { ach_open(r); page = 1; }
+        g_ach_open_test = 0;
+    }
+#endif
     while (open && !(test_ms && SDL_GetTicks() >= end)) {
+#ifdef __linux__
+        if (page) ach_draw(r);
+        else
+#endif
         menu_draw(r, sel);
         rt_gpu_menu_show(s->pixels, MENU_W, MENU_H);
         SDL_Event e;
+#ifdef __linux__
+        rt_ra_idle();  /* the game waits: keep RetroAchievements' connection without reading memory */
+#endif
         if (!SDL_WaitEventTimeout(&e, 16)) continue;
         do {
-            int dx = 0, dy = 0, ok = 0;
+            int dx = 0, dy = 0, ok = 0, back = 0;
             switch (e.type) {
             case SDL_EVENT_QUIT: g_quit = 1; open = 0; break;
             case SDL_EVENT_KEY_DOWN:
                 if (e.key.repeat) break;
-                if (e.key.key == SDLK_F10 || e.key.key == SDLK_ESCAPE) open = 0;
+                if (e.key.key == SDLK_F10) open = 0;
+                else if (e.key.key == SDLK_ESCAPE) back = 1;
                 else if (e.key.key == SDLK_RETURN) ok = 1;
                 else if (e.key.key == SDLK_UP) dy = -1;
                 else if (e.key.key == SDLK_DOWN) dy = 1;
@@ -776,7 +923,7 @@ static void options_menu(int test_ms) {
                 else if (e.key.key == SDLK_RIGHT) dx = 1;
                 break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-                if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST || e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) open = 0;
+                if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST || e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) back = 1;
                 else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) ok = 1;
                 else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_UP) dy = -1;
                 else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_DOWN) dy = 1;
@@ -799,17 +946,32 @@ static void options_menu(int test_ms) {
             default: break;
             }
 #ifdef __linux__
-            if ((dx || dy || ok) && (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) &&
-                twin_press((dx + 1) | (dy + 1) << 2 | ok << 4, e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? e.gbutton.which : e.gaxis.which))
-                dx = dy = ok = 0;
+            if ((dx || dy || ok || back) && (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) &&
+                twin_press((dx + 1) | (dy + 1) << 2 | ok << 4 | back << 5, e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? e.gbutton.which : e.gaxis.which))
+                dx = dy = ok = back = 0;
+            if (page) {  /* the achievements page: B or A back to the options */
+                if (dy) ach_move(dy);
+                if (dx) ach_move(dx * ACH_ROWS);
+                if (back || ok) { ach_close(); page = 0; }
+                continue;
+            }
+            if (ok && sel == MENU_ACH) { ach_open(r); page = 1; continue; }
 #endif
+            if (back) open = 0;
+#ifdef __linux__
+            if (dy) do sel = (sel + dy + MENU_NITEMS) % MENU_NITEMS; while (!item_shown(sel));
+#else
             if (dy) sel = (sel + dy + MENU_NITEMS) % MENU_NITEMS;
+#endif
             if (dx && sel < MENU_NROWS) menu_change(sel, dx);
             if (ok && sel < MENU_NROWS) menu_change(sel, 1);
             if (ok && sel == MENU_BACK) open = 0;
             if (ok && sel == MENU_QUIT) { g_quit = 1; open = 0; }
         } while (open && SDL_PollEvent(&e));
     }
+#ifdef __linux__
+    ach_close();  /* its textures belong to r */
+#endif
     if (r) SDL_DestroyRenderer(r);
     if (s) SDL_DestroySurface(s);
     settings_commit(&before);
@@ -834,6 +996,9 @@ static void test_options(void) {
         if (g_last_frame < f) return;
         spec += used + (spec[used] == ',');
         if (!strcmp(key, "menu")) { options_menu(value); continue; }
+#ifdef __linux__
+        if (!strcmp(key, "logros")) { g_ach_open_test = 1; options_menu(value); continue; }  /* the achievements page */
+#endif
         settings_from_options();
         g_set.fullscreen = g_fullscreen;
         Settings before = g_set;
@@ -897,10 +1062,14 @@ static void pump(void) {
     else if (!g_quit_hold) g_quit_hold = now_us();
     else if (now_us() - g_quit_hold >= 2000000 && !g_quit) { printf("[host] Back+Start held: quitting\n"); g_quit = 1; }
     if (ask && !g_quit && confirm_quit()) g_quit = 1;
+#ifdef __linux__  /* the in-game options menu is the Linux port's: on Windows the launcher has the options */
     if (g_o.gpu && !g_o.input && rt_gpu_active()) {
         if (menu && !g_quit) options_menu(0);
         test_options();
     }
+#else
+    (void)menu;
+#endif
     update_cursor();
     g_last_pump = now_us();
 }

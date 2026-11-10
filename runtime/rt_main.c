@@ -24,6 +24,7 @@
 #include "rt_host.h"
 #include "rt_kernel.h"
 #include "rt_prof.h"
+#include "rt_ra.h"
 #define CASE_TIMEOUT_MS 3000
 #define EXIT_CASE_HUNG 3
 
@@ -283,6 +284,8 @@ static void module_start_params(uint32_t *prio, uint32_t *stack, uint32_t *attr)
 /* Runs the game under the thread scheduler: module_start starts in a kernel-style
  * thread (as the PSP module manager does) and the scheduler runs until every thread
  * is blocked on something the runtime cannot provide yet, or a limit is reached. */
+static int g_ra_cheats;  /* --warp, --load-level, --god or --input: achievements only watch (rt_ra.c) */
+
 static int run_boot(const BootOptions *o) {
     if (!rt_load_image(o->image, NULL)) return 1;
     rt_hle_init(RT_HLE_BOOT, RT_IMAGE_BASE + RT_IMAGE_SIZE, o->max_hle);
@@ -297,6 +300,7 @@ static int run_boot(const BootOptions *o) {
     module_start_params(&prio, &stack, &attr);
     KThread *t = k_thread_create("module_start", RT_ENTRY, prio, stack, attr);
     printf("[boot] module_start thread: prio %u, stack %X, attr %08X\n", prio, stack, attr);
+    rt_ra_start(g_ra_cheats);
     k_thread_start(t, sizeof(path), argp);
 #ifdef __linux__
     /* the arguments now sit on the thread's stack (k_thread_start): free their block, so that the game's first
@@ -324,6 +328,7 @@ static int run_boot(const BootOptions *o) {
     if (o->profile) { rt_prof_start(); g_profile = 1; }
     k_run_scheduler(cpu_ms);
     g_case_running = 0;
+    rt_ra_shutdown();
     rt_frames_close(k_now);
     rt_audio_shutdown(k_now);
     rt_gpu_report();  /* before the host shuts the device down */
@@ -391,6 +396,7 @@ int main(int argc, char **argv) {
             int ch = i + 3 < argc && argv[i + 3][0] != '-' ? atoi(argv[i + 3]) : 0;
             return rt_mpeg_test(pmf, out, ch);
         }
+        else if (rt_ra_option(argc, argv, &i)) continue;
         else if (rt_debug_option(argc, argv, &i)) continue;
         else if (rt_gpu_option(argc, argv, &i)) continue;
         else { fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
@@ -428,5 +434,9 @@ int main(int argc, char **argv) {
     rt_ge_skip_draw = rt_fast_forward > 1;
     rt_mem_init();
     o.image = image;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--warp") || !strcmp(argv[i], "--warp-via") || !strcmp(argv[i], "--load-level") ||
+            !strcmp(argv[i], "--god") || !strcmp(argv[i], "--input"))
+            g_ra_cheats = 1;
     return cases ? run_difftest(image, cases, results) : run_boot(&o);
 }

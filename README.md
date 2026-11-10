@@ -1,3 +1,24 @@
+# God of War PSP en Linux
+
+Chains of Olympus y Ghost of Sparta nativos en Linux, para jugar desde Steam. Es un port de [gow-psp-recomp](https://github.com/DrummingBird1/gow-psp-recomp), que es para Windows.
+
+No trae ningún juego: necesitás tu propio disco en `.iso` o `.chd`.
+
+## Instalar
+
+1. Bajá el AppImage de [Releases](https://github.com/AngeloAscheri/portgowpsplinux/releases) y hacelo ejecutable.
+2. Al lado del AppImage creá `roms/chains-of-olympus/` y `roms/ghost-of-sparta/`, y poné ahí tus discos.
+3. Cerrá Steam y abrí el AppImage. La primera vez tarda unos minutos.
+4. Abrí Steam: vas a ver "God of War PSP" en la biblioteca.
+
+Sirven los discos de EE. UU. y los de Europa. Los logros de RetroAchievements funcionan solo con los europeos.
+
+Más detalles en [docs/linux.md](docs/linux.md).
+
+---
+
+Abajo, el README original (Windows), con los créditos y la licencia.
+
 # God of War PSP: native PC ports (unofficial)
 
 [![Latest release](https://img.shields.io/github/v/release/DrummingBird1/gow-psp-recomp)](https://github.com/DrummingBird1/gow-psp-recomp/releases/latest)
@@ -214,6 +235,8 @@ are numbered `vMAJOR.MINOR.PATCH`, roughly following semantic versioning, and ar
 - [PPSSPP](https://www.ppsspp.org/): the reference for the PSP's hardware and HLE; parts of it are ported in the runtime
   (GPL-2.0-or-later), and its `at3_standalone` decoder and PrxDecrypter are used.
 - libkirk (PSP crypto), libchdr, SDL3, OpenH264.
+- Linux: PPSSPP's [xBRZ](https://sourceforge.net/projects/xbrz/) (GPL-3.0) for "Smooth HUD", and
+  [stb_truetype](https://github.com/nothings/stb) (public domain) for the game picker's text.
 - [Cinzel](https://fonts.google.com/specimen/Cinzel) font (SIL Open Font License).
 - [Qt for Python / PySide6](https://doc.qt.io/qtforpython/) (LGPL-3.0, linked dynamically) for the launcher.
 - The icon is original art (`tools/make_icon.py`).
@@ -221,5 +244,7 @@ are numbered `vMAJOR.MINOR.PATCH`, roughly following semantic versioning, and ar
 ## License
 
 GPL-3.0-or-later (see [`LICENSE`](LICENSE)). CMake downloads the third-party sources at configure time (SDL3, libchdr,
-OpenH264, PPSSPP's `at3_standalone` and `libkirk`) with pinned SHA-256s; they keep their own licenses and are not part
-of this repository. The launcher ships its third-party notices (`tools/launcher_assets/THIRD_PARTY_NOTICES.txt`).
+OpenH264, PPSSPP's `at3_standalone` and `libkirk`; on Linux also xBRZ and stb_truetype) with pinned SHA-256s; they keep
+their own licenses and are not part of this repository. The launcher ships its third-party notices
+(`tools/launcher_assets/THIRD_PARTY_NOTICES.txt`). The Linux AppImage bundles Zig (MIT), CMake (BSD-3-Clause), Ninja
+(Apache-2.0) and a prebuilt SDL3 (zlib), each with its license (`packaging/linux/licenses/README.txt`).

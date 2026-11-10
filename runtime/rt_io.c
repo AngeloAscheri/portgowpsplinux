@@ -23,6 +23,8 @@
 #include <time.h>
 #ifdef __linux__
 #include <dirent.h>
+#include <fcntl.h>
+#include <pthread.h>
 #endif
 #define mkdir_host(p) mkdir(p, 0755)
 #define fseek64 fseeko
@@ -334,6 +336,36 @@ static void host_path(const char *rel, char *out, size_t n) {
 static void host_path(const char *rel, char *out, size_t n) { snprintf(out, n, "%s/%s", g_ms0, rel); }
 #endif
 
+#ifdef __linux__
+/* Linux: while playing, the game reads its open disc files in pieces (Chains keeps an 84 MB block of the disc open),
+ * and the first read of a piece the host hasn't cached yet stalls the whole game, 8-10 ms from an SSD: a dropped
+ * frame at 144 Hz (measured with --perf-csv's io_ms, a cold and a warm cache). When the game opens a disc file, the
+ * host is asked to bring the whole file into its cache in the background (posix_fadvise WILLNEED, in a thread: it
+ * can take a while). The game reads the same bytes as before, only sooner. A .chd is decompressed hunk by hunk: no. */
+typedef struct { int fd; uint64_t off, len; } Prefetch;
+
+static void *prefetch_thread(void *arg) {
+    Prefetch *p = (Prefetch *)arg;
+    posix_fadvise(p->fd, (off_t)p->off, (off_t)p->len, POSIX_FADV_WILLNEED);
+    free(p);
+    return NULL;
+}
+
+static void disc_prefetch(uint64_t off, uint64_t len) {
+    Prefetch *p = g_iso && len ? (Prefetch *)malloc(sizeof(*p)) : NULL;
+    if (!p) return;
+    p->fd = fileno(g_iso);
+    p->off = off;
+    p->len = len;
+    pthread_t t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, prefetch_thread, p) != 0) free(p);
+    pthread_attr_destroy(&a);
+}
+#endif
+
 /* Returns fd (>= 3) or a negative PSP error */
 static int32_t io_open(const char *path, uint32_t flags) {
     char rel[512];
@@ -348,6 +380,9 @@ static int32_t io_open(const char *path, uint32_t flags) {
         if (parse_lbn(rel, &lba, &size)) { f->lba = lba; f->size = size; }
         else if (iso_lookup(rel, &e) && !e.is_dir) { f->lba = e.lba; f->size = e.size; }
         else { fd_free(fd); return (int32_t)SCE_ERR_FILE_NOT_FOUND; }
+#ifdef __linux__
+        disc_prefetch((uint64_t)f->lba * SECTOR, f->size);
+#endif
         return fd;
     }
     if (dev == DEV_MS0) {

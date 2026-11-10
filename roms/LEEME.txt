@@ -13,7 +13,8 @@ Discos que sirven:
   Ghost of Sparta     UCUS98737 (EE. UU., inglés, francés y español)
                       UCES01401 (Europa, con español)
 
-Si ponés los dos discos de un mismo juego, el selector deja elegir cuál jugar.
+Si ponés los dos discos de un mismo juego, el selector abre el europeo, que es el que tiene logros de
+RetroAchievements. Con uno solo, abre ese.
 
 Cómo sacar la copia: con una PSP con firmware personalizado, desde su menú VSH ("USB Device: UMD Disc")
 la PSP muestra el UMD como un .iso por USB; copialo tal cual. Para que ocupe menos, un .chd hecho con

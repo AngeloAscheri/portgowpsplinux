@@ -6,6 +6,8 @@ DIR are unpacked official releases: Zig (ziglang.org), CMake (Kitware's linux-x8
 --sdl3 is an SDL3 built and installed beforehand (cmake --install, see docs/linux.md). The game sources come from git
 (tracked files and new ones not ignored, never game data), the pinned third-party sources from build/deps/, so that the
 player's PC needs no network to build. Writes build/appimage/AppDir and, with --appimagetool, build/appimage/*.AppImage.
+Each bundled program keeps its license: Zig's LICENSE, CMake's doc/cmake (its own and its libraries'), SDL3's
+share/licenses, and packaging/linux/licenses (Ninja, the AppImage runtime) in usr/share/doc/gow-psp/licenses.
 """
 import argparse
 import hashlib
@@ -20,7 +22,7 @@ OUT = ROOT / "build" / "appimage"
 SOURCES = ["CMakeLists.txt", "LICENSE", "cmake", "runtime", "recomp", "re/out/psp_nids_ppsspp.tsv", "re/out/recomp/*.recomp.json",
            "tools/launcher.pyw", "tools/toolchain.py", "tools/steam_shortcuts.py", "tools/launcher_assets/icon.png",
            "tools/launcher_assets/Cinzel[[]wght].ttf", "tools/launcher_assets/OFL.txt", "roms"]
-DEPS = ["at3_standalone", "openh264", "libkirk", "ppsspp_prx", "xbrz", "stb", "libchdr-*"]  # SDL3 goes in prebuilt
+DEPS = ["at3_standalone", "openh264", "libkirk", "ppsspp_prx", "xbrz", "stb", "libchdr-*", "rcheevos-*"]  # SDL3 goes in prebuilt
 BANNED = (".chd", ".iso", ".cso", ".pbp", ".prx", ".bin")
 # Zig only ever builds for x86_64-linux-gnu.2.38 here (tools/toolchain.py): leave out the other targets' libc sources
 # and headers, its docs and tsan (406 -> 246 MB unpacked; the games build byte-identical with what is left)
@@ -80,12 +82,19 @@ def main():
     (src / "manifest.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     lib = app / "usr" / "lib" / "gow-psp"
     shutil.copytree(a.zig, lib / "zig", symlinks=True, ignore=zig_ignore(a.zig))
-    shutil.copytree(a.cmake, lib / "cmake", symlinks=True, ignore=shutil.ignore_patterns("doc", "man"))
+    # CMake without its manual (html, CMake.qch, man), keeping doc/cmake's licenses
+    shutil.copytree(a.cmake, lib / "cmake", symlinks=True, ignore=shutil.ignore_patterns("man", "html", "CMake.qch"))
     (lib / "ninja").mkdir(parents=True)
     shutil.copy2(a.ninja, lib / "ninja" / "ninja")
     shutil.copytree(a.sdl3, lib / "sdl3", symlinks=True)
     (lib / "sdl3" / "VERSION").write_text(hashlib.sha256((Path(a.sdl3) / "lib" / "libSDL3.a").read_bytes()).hexdigest() + "\n")
     here = Path(__file__).resolve().parent
+    shutil.copytree(here / "licenses", app / "usr" / "share" / "doc" / "gow-psp" / "licenses")
+    need = [lib / "zig" / "LICENSE", lib / "cmake" / "doc" / "cmake" / "LICENSE.rst",
+            lib / "sdl3" / "share" / "licenses" / "SDL3" / "LICENSE.txt"]
+    if [p for p in need if not p.is_file()]:
+        sys.exit(f"a bundled program's license is missing: {[str(p) for p in need if not p.is_file()]} (use the "
+                 "official archives, unpacked whole)")
     shutil.copy2(here / "AppRun", app / "AppRun")
     shutil.copy2(here / "gow-psp.desktop", app / "gow-psp.desktop")
     shutil.copy2(ROOT / "tools" / "launcher_assets" / "icon.png", app / "gow-psp.png")

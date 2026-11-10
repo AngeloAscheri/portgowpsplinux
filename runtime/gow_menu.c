@@ -9,16 +9,25 @@
  * whose COMMAND can't be run is shown as unavailable. --settings is the game's own --settings file: Y opens
  * its options, the same as the in-game menu's, and only the ones changed here are written, so the others
  * keep the game's command-line values. --autostart N starts entry N (from 0) once and exits when it ends,
- * without waiting for input. GOW_MENU_TEST_KEYS="y,down,right,b,quit" plays those keys, one per frame,
+ * without waiting for input. GOW_MENU_TEST_KEYS="y,down,right,b,quit" plays those keys, one per frame ("wait"
+ * pauses 50 ms, "text=abc" types),
  * for a test without a gamepad (with SDL_VIDEODRIVER=offscreen, without a window on screen); "right@2" is a
- * press from a second gamepad. */
+ * press from a second gamepad. X opens the game's RetroAchievements list: achievements.txt next to its --settings
+ * file, which the game writes (rt_ra.c), with the icons it downloaded. Start opens the RetroAchievements account
+ * (--ra-ini FILE, the game's --retroachievements file): sign in with an on-screen keyboard, a real one or Steam's,
+ * or sign out. The password goes only to RetroAchievements (GOW_RA_URL replaces the address, for tests) and only
+ * the session token is kept, as tools/ra_login.py does. */
 #include <SDL3/SDL.h>
 
+#include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -40,7 +49,15 @@ typedef struct {
     const char *title, *art, *cmd, *settings;
     int available;
     SDL_Texture *tex;
+    int ach_have, ach_n;  /* from its achievements.txt; ach_n 0 without one */
 } Entry;
+
+/* The achievements panel of one game: open while g_ach_entry >= 0 */
+#define ACH_MAX 160
+typedef struct { int unlocked; unsigned points; char title[96], desc[200]; SDL_Texture *icon; } AchRow;
+static AchRow g_ach[ACH_MAX];
+static int g_ach_entry = -1, g_ach_count, g_ach_sel, g_ach_top;
+static char g_ach_game[96], g_ach_info[96];
 
 typedef struct { const char *label, *key; size_t field; const int *vals; int n; const char *const *names; } OptRow;
 #define OPT_ROW(label, key, field, vals, names) \
@@ -69,6 +86,8 @@ static SDL_Renderer *g_ren;
 static SDL_Gamepad *g_pads[MAX_PADS];
 static int g_stick_latched;
 
+static void ach_summary(Entry *e);
+
 static int ui_open(void) {
     SDL_SetHint(SDL_HINT_APP_NAME, "God of War PSP native port");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "[menu] SDL_Init: %s\n", SDL_GetError()); return 0; }
@@ -84,6 +103,7 @@ static int ui_open(void) {
         g_entries[i].tex = SDL_CreateTextureFromSurface(g_ren, s);
         SDL_DestroySurface(s);
     }
+    for (int i = 0; i < g_count; i++) ach_summary(&g_entries[i]);  /* again after each game: it may have unlocked some */
     g_stick_latched = 0;
     int pads = 0;
     SDL_free(SDL_GetGamepads(&pads));
@@ -99,7 +119,10 @@ static void font_close(void) {
     }
 }
 
+static void ach_close(void);
+
 static void ui_close(void) {
+    ach_close();  /* its icons belong to the renderer */
     font_close();
     for (int i = 0; i < g_count; i++) {
         if (g_entries[i].tex) SDL_DestroyTexture(g_entries[i].tex);
@@ -222,6 +245,514 @@ static void text_centered(float cx, float y, float scale, const char *s) {
     text_at(cx - text_width(scale, s) / 2.0f, y, scale, s);
 }
 
+/* --- RetroAchievements: achievements.txt, written by the game -------------------------------------------------- */
+/* the baked font is ASCII: accents dropped (a for á), other characters left out; at most max bytes */
+static void ascii(const char *s, char *out, size_t max) {
+    static const char latin1[] = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+    size_t n = 0;
+    while (*s && n + 1 < max) {
+        unsigned char c = (unsigned char)*s;
+        unsigned u = c;
+        int len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (len > 1) { u = c & (0xFFu >> (len + 1)); for (int k = 1; k < len && s[k]; k++) u = u << 6 | ((unsigned char)s[k] & 0x3Fu); }
+        for (int k = 0; k < len && *s; k++) s++;
+        char a = u < 0x80 ? (char)u : u >= 0xC0 && u <= 0xFF ? latin1[u - 0xC0] : u == 0x2018 || u == 0x2019 ? '\'' :
+                 u == 0x201C || u == 0x201D ? '"' : u == 0x2013 || u == 0x2014 ? '-' : 0;
+        if (a && (a != ' ' || (n && out[n - 1] != ' '))) out[n++] = a;
+    }
+    out[n] = 0;
+}
+
+/* the game's achievements.txt: next to its settings file */
+static FILE *ach_file(const Entry *e) {
+    const char *slash = e->settings ? strrchr(e->settings, '/') : NULL;
+    if (!slash) return NULL;
+    char path[1024];
+    snprintf(path, sizeof(path), "%.*s/achievements.txt", (int)(slash - e->settings), e->settings);
+    return fopen(path, "r");
+}
+
+/* tab-separated fields of line, in place */
+static int fields(char *line, char **f, int max) {
+    int n = 0;
+    line[strcspn(line, "\r\n")] = 0;
+    for (char *p = line; n < max;) {
+        f[n++] = p;
+        char *t = strchr(p, '\t');
+        if (!t) break;
+        *t = 0;
+        p = t + 1;
+    }
+    return n;
+}
+
+static void ach_summary(Entry *e) {  /* the card's "Logros: 3 de 39" */
+    e->ach_have = e->ach_n = 0;
+    FILE *f = ach_file(e);
+    char line[1024], *fl[8];
+    while (f && fgets(line, sizeof(line), f))
+        if (fields(line, fl, 8) >= 7 && !strcmp(fl[0], "game")) { e->ach_have = atoi(fl[3]); e->ach_n = atoi(fl[4]); break; }
+    if (f) fclose(f);
+}
+
+static void ach_close(void) {
+    for (int i = 0; i < g_ach_count; i++) if (g_ach[i].icon) SDL_DestroyTexture(g_ach[i].icon);
+    g_ach_count = 0;
+    g_ach_entry = -1;
+}
+
+static void ach_open(int entry) {
+    FILE *f = ach_file(&g_entries[entry]);
+    if (!f) return;
+    ach_close();
+    g_ach_entry = entry;
+    g_ach_sel = g_ach_top = 0;
+    snprintf(g_ach_game, sizeof(g_ach_game), "%s", g_entries[entry].title);
+    g_ach_info[0] = 0;
+    char line[1024], *fl[8];
+    int icons = 0;
+    while (fgets(line, sizeof(line), f)) {
+        int n = fields(line, fl, 8);
+        if (n >= 7 && !strcmp(fl[0], "game")) {
+            ascii(fl[2], g_ach_game, sizeof(g_ach_game));
+            snprintf(g_ach_info, sizeof(g_ach_info), "%s de %s logros     %s de %s puntos", fl[3], fl[4], fl[5], fl[6]);
+        } else if (n >= 6 && !strcmp(fl[0], "a") && g_ach_count < ACH_MAX) {
+            AchRow *a = &g_ach[g_ach_count++];
+            a->unlocked = atoi(fl[1]) != 0;
+            a->points = (unsigned)strtoul(fl[2], NULL, 10);
+            ascii(fl[3], a->title, sizeof(a->title));
+            ascii(fl[4], a->desc, sizeof(a->desc));
+            SDL_Surface *png = *fl[5] ? SDL_LoadPNG(fl[5]) : NULL;
+            a->icon = png ? SDL_CreateTextureFromSurface(g_ren, png) : NULL;
+            SDL_DestroySurface(png);
+            if (a->icon) {
+                icons++;
+                SDL_SetTextureScaleMode(a->icon, SDL_SCALEMODE_LINEAR);
+                if (!a->unlocked) SDL_SetTextureColorMod(a->icon, 90, 90, 90);
+            }
+        }
+    }
+    fclose(f);
+    printf("[menu] achievements of %s: %d, %d icons\n", g_entries[entry].title, g_ach_count, icons);
+}
+
+/* text cut to fit width w at scale, with "..." */
+static void fit_text(float scale, float w, const char *s, char *out, size_t n);
+
+/* The achievements panel over the cards: unlocked first, then locked (icon dimmed), with points */
+static void draw_achievements(int w, int h, float text) {
+    float line = text * 12.0f, row = line * 2.4f, pw = text * 8.0f * 64.0f;
+    int rows = 8;
+    if (pw > (float)w * 0.92f) pw = (float)w * 0.92f;
+    float ph = line * 5.0f + row * (float)rows;
+    if (ph > (float)h * 0.9f) { rows = (int)(((float)h * 0.9f - line * 5.0f) / row); if (rows < 1) rows = 1; ph = line * 5.0f + row * (float)rows; }
+    if (g_ach_sel < g_ach_top) g_ach_top = g_ach_sel;
+    if (g_ach_sel >= g_ach_top + rows) g_ach_top = g_ach_sel - rows + 1;
+    SDL_FRect r = { ((float)w - pw) / 2.0f, ((float)h - ph) / 2.0f, pw, ph };
+    SDL_SetRenderDrawColor(g_ren, 233, 214, 164, 255);
+    SDL_FRect border = { r.x - text, r.y - text, r.w + 2 * text, r.h + 2 * text };
+    SDL_RenderFillRect(g_ren, &border);
+    SDL_SetRenderDrawColor(g_ren, 18, 14, 12, 255);
+    SDL_RenderFillRect(g_ren, &r);
+    SDL_SetRenderDrawColor(g_ren, 233, 214, 164, 255);
+    text_centered((float)w / 2.0f, r.y + line * 0.8f, text, g_ach_game);
+    SDL_SetRenderDrawColor(g_ren, 180, 170, 150, 255);
+    text_centered((float)w / 2.0f, r.y + line * 2.0f, text * 0.75f, g_ach_count ? g_ach_info : "Sin logros cargados");
+    float ix = r.x + text * 8.0f, isz = row - text * 4.0f, tx = ix + isz + text * 6.0f, right = r.x + pw - text * 8.0f;
+    for (int i = g_ach_top; i < g_ach_count && i < g_ach_top + rows; i++) {
+        const AchRow *a = &g_ach[i];
+        float y = r.y + line * 3.4f + row * (float)(i - g_ach_top);
+        if (i == g_ach_sel) {
+            SDL_SetRenderDrawColor(g_ren, 70, 54, 28, 255);
+            SDL_FRect bar = { r.x + text * 3.0f, y - text, pw - text * 6.0f, row - text * 2.0f };
+            SDL_RenderFillRect(g_ren, &bar);
+        }
+        SDL_FRect ir = { ix, y, isz, isz };
+        if (a->icon) SDL_RenderTexture(g_ren, a->icon, NULL, &ir);
+        else { SDL_SetRenderDrawColor(g_ren, 40, 32, 28, 255); SDL_RenderFillRect(g_ren, &ir); }
+        char pts[24], cut[200];
+        snprintf(pts, sizeof(pts), "%u", a->points);
+        float pw2 = text_width(text, pts);
+        if (a->unlocked) SDL_SetRenderDrawColor(g_ren, 233, 214, 164, 255);
+        else { Uint8 c = i == g_ach_sel ? 230 : 170; SDL_SetRenderDrawColor(g_ren, c, c, c, 255); }
+        fit_text(text, right - tx - pw2 - text * 8.0f, a->title, cut, sizeof(cut));
+        text_at(tx, y + text * 1.0f, text, cut);
+        text_at(right - pw2, y + text * 1.0f, text, pts);
+        SDL_SetRenderDrawColor(g_ren, 150, 140, 125, 255);
+        fit_text(text * 0.75f, right - tx, a->desc, cut, sizeof(cut));
+        text_at(tx, y + text * 12.0f, text * 0.75f, cut);
+    }
+    SDL_SetRenderDrawColor(g_ren, 180, 170, 150, 255);
+    char where[32];
+    if (g_ach_count > rows) {
+        snprintf(where, sizeof(where), "%d / %d", g_ach_sel + 1, g_ach_count);
+        text_centered((float)w / 2.0f, r.y + ph - line * 1.4f, text * 0.75f, where);
+    }
+}
+
+static void fit_text(float scale, float w, const char *s, char *out, size_t n) {
+    snprintf(out, n, "%s", s);
+    size_t len = strlen(out);
+    if (text_width(scale, out) <= w) return;
+    while (len > 0) {
+        len--;
+        while (len > 0 && out[len - 1] == ' ') len--;
+        if (len + 4 > n) continue;
+        memcpy(out + len, "...", 4);
+        if (text_width(scale, out) <= w) return;
+    }
+    out[0] = 0;
+}
+
+/* --- RetroAchievements account ------------------------------------------------------------------------------------ */
+#define RA_USER_AGENT "GoWPSPRecomp/0.1 (Linux)"
+enum { ACCT_CLOSED, ACCT_FORM, ACCT_SIGNED, ACCT_WAIT };
+static const char *g_ra_ini;          /* --ra-ini */
+static char g_ra_signed[64];           /* the user in it, "" when signed out */
+static int g_acct, g_acct_field, g_acct_sel, g_kb_row, g_kb_col, g_kb_shift, g_kb_sym;
+static char g_acct_user[64], g_acct_pass[128], g_acct_msg[160];
+static struct { pthread_t t; volatile int done; int ok; char user[64], token[128], err[160]; } g_login;
+
+/* the keyboard: four rows of characters (letters, or symbols), then Mayus, Simbolos, Espacio, Borrar, Entrar, and
+ * Steam's own keyboard when Steam started us */
+static const char *const KB_LETTERS[4] = { "1234567890", "qwertyuiop", "asdfghjkl@", "zxcvbnm._-" };
+static const char *const KB_SYMBOLS[4] = { "!\"#$%&'()*", "+,/:;<=>?[", "\\]^`{|}~", "0123456789" };
+enum { KB_SHIFT, KB_SYM, KB_SPACE, KB_DEL, KB_ENTER, KB_STEAM };
+static int kb_specials(void) { return getenv("SteamGameId") || getenv("SteamAppId") ? 6 : 5; }
+
+static void ra_read_ini(void) {
+    g_ra_signed[0] = 0;
+    FILE *f = g_ra_ini ? fopen(g_ra_ini, "r") : NULL;
+    char line[256], user[64] = "";
+    int token = 0;
+    while (f && fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!strncmp(line, "user=", 5)) snprintf(user, sizeof(user), "%s", line + 5);
+        if (!strncmp(line, "token=", 6) && line[6]) token = 1;
+    }
+    if (f) fclose(f);
+    if (token) ascii(user, g_ra_signed, sizeof(g_ra_signed));
+}
+
+/* libcurl, loaded at run time like the game does (rt_ra.c) */
+static struct {
+    void *lib;
+    void *(*easy_init)(void);
+    int (*easy_setopt)(void *, int, ...);
+    int (*easy_perform)(void *);
+    void (*easy_cleanup)(void *);
+} g_curl;
+typedef struct { char *data; size_t len; } Body;
+static size_t on_body(char *p, size_t size, size_t n, void *user) {
+    Body *b = (Body *)user;
+    if (b->len + size * n > 65536) return 0;
+    char *grown = (char *)realloc(b->data, b->len + size * n + 1);
+    if (!grown) return 0;
+    memcpy(grown + b->len, p, size * n);
+    b->data = grown;
+    b->len += size * n;
+    b->data[b->len] = 0;
+    return size * n;
+}
+
+static int curl_ready(void) {
+    static const char *const names[] = { "libcurl.so.4", "libcurl-gnutls.so.4", "libcurl.so" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !g_curl.lib; i++) g_curl.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+    if (!g_curl.lib) return 0;
+    int (*global_init)(long) = (int (*)(long))dlsym(g_curl.lib, "curl_global_init");
+    *(void **)&g_curl.easy_init = dlsym(g_curl.lib, "curl_easy_init");
+    *(void **)&g_curl.easy_setopt = dlsym(g_curl.lib, "curl_easy_setopt");
+    *(void **)&g_curl.easy_perform = dlsym(g_curl.lib, "curl_easy_perform");
+    *(void **)&g_curl.easy_cleanup = dlsym(g_curl.lib, "curl_easy_cleanup");
+    static int inited;
+    if (!inited && global_init) inited = global_init(3) == 0;
+    return inited && g_curl.easy_init && g_curl.easy_setopt && g_curl.easy_perform && g_curl.easy_cleanup;
+}
+
+static void url_encode(const char *s, char *out, size_t n) {
+    size_t k = 0;
+    for (; *s && k + 4 < n; s++) {
+        unsigned char c = (unsigned char)*s;
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || strchr("-_.~", c)) out[k++] = (char)c;
+        else k += (size_t)snprintf(out + k, n - k, "%%%02X", c);
+    }
+    out[k] = 0;
+}
+
+/* the string value of "key" in a flat JSON answer, unescaped (enough for login2's) */
+static int json_str(const char *json, const char *key, char *out, size_t n) {
+    char pat[40];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p != '"') return 0;
+    size_t k = 0;
+    for (p++; *p && *p != '"' && k + 1 < n; p++) {
+        if (*p == '\\' && p[1]) { p++; out[k++] = *p == 'n' ? ' ' : *p; }
+        else out[k++] = *p;
+    }
+    out[k] = 0;
+    return 1;
+}
+
+static int json_true(const char *json, const char *key) {
+    char pat[40];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return 0;
+    for (p += strlen(pat); *p == ' ' || *p == ':'; p++) {}
+    return !strncmp(p, "true", 4);
+}
+
+static void *login_thread(void *arg) {
+    (void)arg;
+    char u[200], pw[400], post[700];
+    url_encode(g_acct_user, u, sizeof(u));
+    url_encode(g_acct_pass, pw, sizeof(pw));
+    snprintf(post, sizeof(post), "r=login2&u=%s&p=%s", u, pw);
+    memset(pw, 0, sizeof(pw));
+    const char *url = getenv("GOW_RA_URL");
+    Body b = { NULL, 0 };
+    void *h = g_curl.easy_init();
+    int sent = 0;
+    if (h) {
+        g_curl.easy_setopt(h, 10002, url && *url ? url : "https://retroachievements.org/dorequest.php");  /* URL */
+        g_curl.easy_setopt(h, 10018, RA_USER_AGENT);                                                     /* USERAGENT */
+        g_curl.easy_setopt(h, 99, 1L);                                                                   /* NOSIGNAL */
+        g_curl.easy_setopt(h, 13, 30L);                                                                  /* TIMEOUT */
+        g_curl.easy_setopt(h, 20011, on_body);                                                           /* WRITEFUNCTION */
+        g_curl.easy_setopt(h, 10001, &b);                                                                /* WRITEDATA */
+        g_curl.easy_setopt(h, 10015, post);                                                              /* POSTFIELDS */
+        sent = g_curl.easy_perform(h) == 0;
+        g_curl.easy_cleanup(h);
+    }
+    memset(post, 0, sizeof(post));
+    g_login.ok = 0;
+    if (!sent || !b.data) snprintf(g_login.err, sizeof(g_login.err), "No se pudo conectar con RetroAchievements");
+    else if (!json_true(b.data, "Success") || !json_str(b.data, "Token", g_login.token, sizeof(g_login.token)) || !g_login.token[0]) {
+        char e[160] = "";
+        json_str(b.data, "Error", e, sizeof(e));
+        ascii(e[0] ? e : "Usuario o contrasena incorrectos", g_login.err, sizeof(g_login.err));
+    } else {
+        if (!json_str(b.data, "User", g_login.user, sizeof(g_login.user)) || !g_login.user[0])
+            snprintf(g_login.user, sizeof(g_login.user), "%s", g_acct_user);
+        g_login.ok = 1;
+    }
+    free(b.data);
+    g_login.done = 1;
+    return NULL;
+}
+
+/* the token into --ra-ini, readable by the player alone */
+static int ra_write_ini(void) {
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", g_ra_ini);
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = 0; mkdir(dir, 0755); }
+    char tmp[1100];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g_ra_ini);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 0;
+    char text[300];
+    int n = snprintf(text, sizeof(text), "user=%s\ntoken=%s\n", g_login.user, g_login.token);
+    int ok = write(fd, text, (size_t)n) == n && fchmod(fd, 0600) == 0;
+    ok = close(fd) == 0 && ok && rename(tmp, g_ra_ini) == 0;
+    if (!ok) unlink(tmp);
+    memset(g_login.token, 0, sizeof(g_login.token));
+    return ok;
+}
+
+static void acct_open(void) {
+    ra_read_ini();
+    g_acct_msg[0] = 0;
+    g_acct_sel = 0;
+    if (g_ra_signed[0]) { g_acct = ACCT_SIGNED; return; }
+    g_acct = ACCT_FORM;
+    g_acct_field = 0;
+    g_acct_user[0] = g_acct_pass[0] = 0;
+    g_kb_row = g_kb_col = g_kb_shift = g_kb_sym = 0;
+    SDL_StartTextInput(g_win);  /* a real keyboard types too */
+}
+
+static void acct_close(void) {
+    if (g_acct == ACCT_FORM) SDL_StopTextInput(g_win);
+    memset(g_acct_pass, 0, sizeof(g_acct_pass));
+    g_acct = ACCT_CLOSED;
+}
+
+static void acct_type(const char *t) {
+    char *f = g_acct_field ? g_acct_pass : g_acct_user;
+    size_t cap = g_acct_field ? sizeof(g_acct_pass) : sizeof(g_acct_user), len = strlen(f);
+    for (; *t && len + 1 < cap; t++) if ((unsigned char)*t >= 32 && (unsigned char)*t < 127) f[len++] = *t;
+    f[len] = 0;
+    g_acct_msg[0] = 0;
+}
+
+static void acct_delete(void) {
+    char *f = g_acct_field ? g_acct_pass : g_acct_user;
+    size_t len = strlen(f);
+    if (len) f[len - 1] = 0;
+}
+
+static void acct_submit(void) {
+    if (!g_acct_user[0]) { g_acct_field = 0; snprintf(g_acct_msg, sizeof(g_acct_msg), "Escribi tu usuario"); return; }
+    if (!g_acct_pass[0]) { g_acct_field = 1; snprintf(g_acct_msg, sizeof(g_acct_msg), "Escribi tu contrasena"); return; }
+    if (!curl_ready()) { snprintf(g_acct_msg, sizeof(g_acct_msg), "Falta libcurl: no se puede conectar"); return; }
+    memset(&g_login, 0, sizeof(g_login));
+    if (pthread_create(&g_login.t, NULL, login_thread, NULL) != 0) { snprintf(g_acct_msg, sizeof(g_acct_msg), "No se pudo conectar"); return; }
+    SDL_StopTextInput(g_win);
+    g_acct = ACCT_WAIT;
+    printf("[menu] signing in to RetroAchievements as %s\n", g_acct_user);
+}
+
+/* each frame: the answer, once it arrived */
+static void acct_poll(void) {
+    if (g_acct != ACCT_WAIT || !g_login.done) return;
+    pthread_join(g_login.t, NULL);
+    memset(g_acct_pass, 0, sizeof(g_acct_pass));
+    if (g_login.ok && ra_write_ini()) {
+        ra_read_ini();
+        printf("[menu] signed in to RetroAchievements as %s\n", g_ra_signed);
+        g_acct = ACCT_SIGNED;
+        g_acct_sel = 1;
+        snprintf(g_acct_msg, sizeof(g_acct_msg), "Listo: los juegos ya dan logros");
+        return;
+    }
+    if (g_login.ok) snprintf(g_login.err, sizeof(g_login.err), "No se pudo guardar la sesion");
+    printf("[menu] RetroAchievements sign-in failed: %s\n", g_login.err);
+    g_acct = ACCT_FORM;
+    g_acct_field = 1;
+    snprintf(g_acct_msg, sizeof(g_acct_msg), "%s", g_login.err);
+    SDL_StartTextInput(g_win);
+}
+
+static void acct_sign_out(void) {
+    if (g_ra_ini && unlink(g_ra_ini) != 0 && errno != ENOENT) { snprintf(g_acct_msg, sizeof(g_acct_msg), "No se pudo cerrar la sesion"); return; }
+    printf("[menu] signed out of RetroAchievements\n");
+    g_ra_signed[0] = 0;
+    acct_close();
+}
+
+static const char *kb_special_label(int k) {
+    static const char *const names[] = { "Mayus", NULL, "Espacio", "Borrar", "Entrar", "Teclado de Steam" };
+    return k == KB_SYM ? (g_kb_sym ? "Letras" : "Simbolos") : names[k];
+}
+
+static int kb_row_len(int row) {
+    if (row == 4) return kb_specials();
+    return (int)strlen((g_kb_sym ? KB_SYMBOLS : KB_LETTERS)[row]);
+}
+
+static void kb_move(int dx, int dy) {
+    int old_len = kb_row_len(g_kb_row);
+    if (dy) {
+        int row = (g_kb_row + dy + 5) % 5, len = kb_row_len(row);
+        g_kb_col = old_len > 1 ? g_kb_col * (len - 1 + (len > 1 ? 0 : 1)) / (old_len - 1) : 0;
+        if (g_kb_col >= len) g_kb_col = len - 1;
+        g_kb_row = row;
+    }
+    if (dx) { int len = kb_row_len(g_kb_row); g_kb_col = (g_kb_col + dx + len) % len; }
+}
+
+static void kb_press(void) {
+    if (g_kb_row < 4) {
+        char c[2] = { (g_kb_sym ? KB_SYMBOLS : KB_LETTERS)[g_kb_row][g_kb_col], 0 };
+        if (g_kb_shift && c[0] >= 'a' && c[0] <= 'z') c[0] = (char)(c[0] - 'a' + 'A');
+        acct_type(c);
+        return;
+    }
+    switch (g_kb_col) {
+    case KB_SHIFT: g_kb_shift = !g_kb_shift; break;
+    case KB_SYM: g_kb_sym = !g_kb_sym; if (g_kb_col >= kb_row_len(g_kb_row)) g_kb_col = 0; break;
+    case KB_SPACE: acct_type(" "); break;
+    case KB_DEL: acct_delete(); break;
+    case KB_ENTER: if (g_acct_field == 0) g_acct_field = 1; else acct_submit(); break;
+    case KB_STEAM: SDL_OpenURL("steam://open/keyboard?XPosition=0&YPosition=0&Width=0&Height=0&Mode=0"); break;
+    }
+}
+
+static void draw_account(int w, int h, float text) {
+    float line = text * 12.0f, pw = text * 8.0f * 56.0f;
+    if (pw > (float)w * 0.92f) pw = (float)w * 0.92f;
+    float ph = g_acct == ACCT_FORM ? line * 17.0f : line * 8.0f;
+    SDL_FRect r = { ((float)w - pw) / 2.0f, ((float)h - ph) / 2.0f, pw, ph };
+    SDL_SetRenderDrawColor(g_ren, 233, 214, 164, 255);
+    SDL_FRect border = { r.x - text, r.y - text, r.w + 2 * text, r.h + 2 * text };
+    SDL_RenderFillRect(g_ren, &border);
+    SDL_SetRenderDrawColor(g_ren, 18, 14, 12, 255);
+    SDL_RenderFillRect(g_ren, &r);
+    SDL_SetRenderDrawColor(g_ren, 233, 214, 164, 255);
+    text_centered((float)w / 2.0f, r.y + line * 0.8f, text, "RETROACHIEVEMENTS");
+    float cx = (float)w / 2.0f;
+    if (g_acct == ACCT_WAIT) {
+        SDL_SetRenderDrawColor(g_ren, 200, 190, 170, 255);
+        text_centered(cx, r.y + line * 3.5f, text, "Conectando...");
+        return;
+    }
+    if (g_acct == ACCT_SIGNED) {
+        char who[96];
+        snprintf(who, sizeof(who), "Sesion iniciada: %s", g_ra_signed);
+        SDL_SetRenderDrawColor(g_ren, 200, 190, 170, 255);
+        text_centered(cx, r.y + line * 2.4f, text, who);
+        static const char *const items[] = { "Cerrar sesion", "Volver" };
+        for (int i = 0; i < 2; i++) {
+            Uint8 c = i == g_acct_sel ? 255 : 150;
+            if (i == g_acct_sel) SDL_SetRenderDrawColor(g_ren, 233, 214, 164, 255);
+            else SDL_SetRenderDrawColor(g_ren, c, c, c, 255);
+            text_centered(cx, r.y + line * (float)(4 + i), text, items[i]);
+        }
+        SDL_SetRenderDrawColor(g_ren, 180, 170, 150, 255);
+        if (g_acct_msg[0]) text_centered(cx, r.y + line * 6.6f, text * 0.75f, g_acct_msg);
+        return;
+    }
+    /* the two fields */
+    float fx = r.x + text * 16.0f, fw = pw - text * 32.0f;
+    for (int i = 0; i < 2; i++) {
+        float y = r.y + line * (2.2f + 1.6f * (float)i);
+        SDL_SetRenderDrawColor(g_ren, i == g_acct_field ? 233 : 150, i == g_acct_field ? 214 : 140, i == g_acct_field ? 164 : 120, 255);
+        text_at(fx, y, text * 0.75f, i ? "Contrasena" : "Usuario");
+        SDL_FRect box = { fx + fw * 0.3f, y - text * 3.0f, fw * 0.7f, line };
+        SDL_SetRenderDrawColor(g_ren, i == g_acct_field ? 60 : 36, i == g_acct_field ? 48 : 30, i == g_acct_field ? 28 : 24, 255);
+        SDL_RenderFillRect(g_ren, &box);
+        char shown[140];
+        const char *v = i ? g_acct_pass : g_acct_user;
+        size_t n = strlen(v);
+        if (i) { memset(shown, '*', n < sizeof(shown) - 2 ? n : sizeof(shown) - 2); shown[n < sizeof(shown) - 2 ? n : sizeof(shown) - 2] = 0; }
+        else snprintf(shown, sizeof(shown), "%s", v);
+        if (i == g_acct_field && n + 1 < sizeof(shown)) strcat(shown, "_");
+        char cut[140];
+        fit_text(text, box.w - text * 4.0f, shown, cut, sizeof(cut));
+        SDL_SetRenderDrawColor(g_ren, 240, 234, 220, 255);
+        text_at(box.x + text * 2.0f, y, text, cut);
+    }
+    /* the keyboard */
+    float ky = r.y + line * 6.0f, kh = line * 1.6f, kx = r.x + text * 8.0f, kw = pw - text * 16.0f;
+    for (int row = 0; row < 5; row++) {
+        int len = kb_row_len(row);
+        float cw = kw / (float)(row == 4 ? len : 10), x0 = kx + (row < 4 ? (kw - cw * (float)len) / 2.0f : 0);
+        for (int k = 0; k < len; k++) {
+            SDL_FRect key = { x0 + cw * (float)k + text, ky + kh * (float)row + text, cw - 2 * text, kh - 2 * text };
+            int on = row == g_kb_row && k == g_kb_col;
+            SDL_SetRenderDrawColor(g_ren, on ? 233 : 44, on ? 214 : 36, on ? 164 : 30, 255);
+            SDL_RenderFillRect(g_ren, &key);
+            char label[24];
+            if (row < 4) {
+                char c = (g_kb_sym ? KB_SYMBOLS : KB_LETTERS)[row][k];
+                if (g_kb_shift && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+                label[0] = c; label[1] = 0;
+            } else snprintf(label, sizeof(label), "%s%s", kb_special_label(k), k == KB_SHIFT && g_kb_shift ? " *" : "");
+            float sc = row == 4 ? text * 0.6f : text;
+            Uint8 c = on ? 20 : 220;
+            SDL_SetRenderDrawColor(g_ren, c, c, c, 255);
+            text_centered(key.x + key.w / 2.0f, key.y + (key.h - 7.0f * sc) / 2.0f, sc, label);
+        }
+    }
+    SDL_SetRenderDrawColor(g_ren, 230, 150, 120, 255);
+    if (g_acct_msg[0]) text_centered(cx, r.y + ph - line * 1.3f, text * 0.75f, g_acct_msg);
+}
+
 /* The options panel over the cards. Every change takes effect the next time the game opens. */
 static void draw_options(int w, int h, float text) {
     float line = text * 12.0f, pw = text * 8.0f * 44.0f, ph = line * (float)(OPT_N + 5);
@@ -294,15 +825,34 @@ static void draw(void) {
         SDL_SetRenderDrawColor(g_ren, c, c, c, 255);
         text_centered(cx, ty, text, e->title);
         if (!e->available) text_centered(cx, ty + text * 12.0f, text * 0.75f, "No disponible");
+        else if (e->ach_n) {
+            char ach[48];
+            snprintf(ach, sizeof(ach), "Logros: %d de %d", e->ach_have, e->ach_n);
+            SDL_SetRenderDrawColor(g_ren, sel ? 233 : 150, sel ? 214 : 140, sel ? 164 : 120, 255);
+            text_centered(cx, ty + text * 12.0f, text * 0.75f, ach);
+        }
     }
     SDL_SetRenderDrawColor(g_ren, 180, 170, 150, 255);
-    if (g_opt_entry >= 0) {
+    if (g_acct != ACCT_CLOSED) {
+        draw_account(w, h, text);
+        SDL_SetRenderDrawColor(g_ren, 180, 170, 150, 255);
+        text_centered((float)w / 2.0f, (float)h - text * 16.0f, text * 0.8f,
+                      g_acct == ACCT_FORM ? "A: tecla   B: borrar   X: mayus   Y: cambiar campo   Start: entrar   Back: salir" :
+                      g_acct == ACCT_SIGNED ? "A: elegir     B: volver" : "");
+    } else if (g_ach_entry >= 0) {
+        draw_achievements(w, h, text);
+        SDL_SetRenderDrawColor(g_ren, 180, 170, 150, 255);
+        text_centered((float)w / 2.0f, (float)h - text * 16.0f, text, "Arriba/Abajo: mover     B: volver");
+    } else if (g_opt_entry >= 0) {
         draw_options(w, h, text);
         SDL_SetRenderDrawColor(g_ren, 180, 170, 150, 255);
         text_centered((float)w / 2.0f, (float)h - text * 16.0f, text, "Y: OK");
     } else {
-        text_centered((float)w / 2.0f, (float)h - text * 16.0f, text,
-                      g_entries[g_sel].settings ? "A: Jugar     Y: Opciones     B: Salir" : "A: Jugar     B: Salir");
+        const Entry *e = &g_entries[g_sel];
+        char help[96];
+        snprintf(help, sizeof(help), "A: Jugar%s%s%s     B: Salir", e->ach_n ? "     X: Logros" : "", e->settings ? "     Y: Opciones" : "",
+                 g_ra_ini ? "     Start: Cuenta" : "");
+        text_centered((float)w / 2.0f, (float)h - text * 16.0f, text, help);
     }
     SDL_RenderPresent(g_ren);
 }
@@ -378,7 +928,7 @@ static void opt_change(int d) {
     g_opt_changed = 1;
 }
 
-enum { IN_LEFT, IN_RIGHT, IN_UP, IN_DOWN, IN_PLAY, IN_BACK, IN_OPTIONS };
+enum { IN_LEFT, IN_RIGHT, IN_UP, IN_DOWN, IN_PLAY, IN_BACK, IN_OPTIONS, IN_ACH, IN_START, IN_SELECT };
 
 /* With Steam Input on a desktop, SDL sees the gamepad twice (Steam's virtual one and the real one): a press
  * arrives from both, which opened and closed the options at once, moved two values and quit after a B. The same
@@ -395,6 +945,32 @@ static int twin(int in, SDL_JoystickID dev) {
 
 /* One button or key press: returns 1 to start the chosen game, -1 to quit. */
 static int press(int in) {
+    if (g_acct == ACCT_WAIT) return 0;
+    if (g_acct == ACCT_SIGNED) {
+        if (in == IN_UP || in == IN_DOWN) g_acct_sel ^= 1;
+        else if (in == IN_PLAY && g_acct_sel == 0) acct_sign_out();
+        else if (in == IN_PLAY || in == IN_BACK || in == IN_START || in == IN_SELECT) acct_close();
+        return 0;
+    }
+    if (g_acct == ACCT_FORM) {
+        if (in == IN_LEFT || in == IN_RIGHT) kb_move(in == IN_LEFT ? -1 : 1, 0);
+        else if (in == IN_UP || in == IN_DOWN) kb_move(0, in == IN_UP ? -1 : 1);
+        else if (in == IN_PLAY) kb_press();
+        else if (in == IN_BACK) acct_delete();
+        else if (in == IN_ACH) g_kb_shift = !g_kb_shift;
+        else if (in == IN_OPTIONS) g_acct_field ^= 1;
+        else if (in == IN_START) acct_submit();
+        else if (in == IN_SELECT) acct_close();
+        return 0;
+    }
+    if (g_ach_entry >= 0) {
+        if (in == IN_UP || in == IN_DOWN) g_ach_sel += in == IN_UP ? -1 : 1;
+        else if (in == IN_LEFT || in == IN_RIGHT) g_ach_sel += in == IN_LEFT ? -8 : 8;
+        else if (in == IN_BACK || in == IN_ACH || in == IN_PLAY) ach_close();
+        if (g_ach_sel >= g_ach_count) g_ach_sel = g_ach_count - 1;
+        if (g_ach_sel < 0) g_ach_sel = 0;
+        return 0;
+    }
     if (g_opt_entry >= 0) {
         if (in == IN_UP || in == IN_DOWN) opt_move(in == IN_UP ? -1 : 1);
         else if (in == IN_LEFT || in == IN_RIGHT) opt_change(in == IN_LEFT ? -1 : 1);
@@ -405,6 +981,8 @@ static int press(int in) {
     else if (in == IN_PLAY) return 1;
     else if (in == IN_BACK) return -1;
     else if (in == IN_OPTIONS && g_entries[g_sel].settings) opt_open(g_sel);
+    else if (in == IN_ACH && g_entries[g_sel].ach_n) ach_open(g_sel);
+    else if (in == IN_START && g_ra_ini) acct_open();
     return 0;
 }
 
@@ -414,16 +992,26 @@ static int test_key(SDL_JoystickID *dev) {
     static const char *next;
     static const struct { const char *name; int in; } names[] = {
         { "left", IN_LEFT }, { "right", IN_RIGHT }, { "up", IN_UP }, { "down", IN_DOWN },
-        { "a", IN_PLAY }, { "b", IN_BACK }, { "y", IN_OPTIONS }, { "quit", -1 },
+        { "a", IN_PLAY }, { "b", IN_BACK }, { "y", IN_OPTIONS }, { "x", IN_ACH }, { "start", IN_START },
+        { "select", IN_SELECT }, { "wait", -4 }, { "quit", -1 },
     };
     if (!next) next = getenv("GOW_MENU_TEST_KEYS");
     if (!next || !*next) return -2;
+    if (!strncmp(next, "text=", 5)) {  /* "text=abc": typed as with a real keyboard (no comma inside) */
+        char t[128];
+        size_t n = strcspn(next + 5, ",");
+        snprintf(t, sizeof(t), "%.*s", (int)n, next + 5);
+        if (g_acct == ACCT_FORM) acct_type(t);
+        next += 5 + n + (next[5 + n] == ',');
+        return -3;
+    }
     size_t len = strcspn(next, ","), name_len = strcspn(next, ",@");
     int in = -3;
     *dev = name_len < len ? (SDL_JoystickID)atoi(next + name_len + 1) : 1;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
         if (strlen(names[i].name) == name_len && !strncmp(next, names[i].name, name_len)) in = names[i].in;
     next += len + (next[len] == ',');
+    if (in == -4) SDL_Delay(50);  /* "wait": 50 ms, for an answer from the network */
     return in;
 }
 
@@ -503,10 +1091,12 @@ int main(int argc, char **argv) {
             e->available = access(e->cmd, X_OK) == 0;
         } else if (!strcmp(argv[i], "--settings") && i + 1 < argc && g_count > 0) {
             g_entries[g_count - 1].settings = argv[++i];
+        } else if (!strcmp(argv[i], "--ra-ini") && i + 1 < argc) {
+            g_ra_ini = argv[++i];
         } else if (!strcmp(argv[i], "--autostart") && i + 1 < argc) {
             autostart = atoi(argv[++i]);
         } else {
-            fprintf(stderr, "usage: %s --entry TITLE ART COMMAND [--settings FILE] [--entry ...] [--autostart N]\n", argv[0]);
+            fprintf(stderr, "usage: %s --entry TITLE ART COMMAND [--settings FILE] [--entry ...] [--ra-ini FILE] [--autostart N]\n", argv[0]);
             return 2;
         }
     }
@@ -540,6 +1130,9 @@ int main(int argc, char **argv) {
                 else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) in = IN_PLAY;
                 else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) in = IN_BACK;
                 else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_NORTH) in = IN_OPTIONS;
+                else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_WEST) in = IN_ACH;
+                else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_START) in = IN_START;
+                else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) in = IN_SELECT;
                 break;
             case SDL_EVENT_GAMEPAD_AXIS_MOTION:
                 if (ev.gaxis.axis != SDL_GAMEPAD_AXIS_LEFTX && ev.gaxis.axis != SDL_GAMEPAD_AXIS_LEFTY) break;
@@ -550,8 +1143,24 @@ int main(int argc, char **argv) {
                     else in = ev.gaxis.value < 0 ? IN_UP : IN_DOWN;
                 }
                 break;
+            case SDL_EVENT_TEXT_INPUT:
+                if (live && g_acct == ACCT_FORM) acct_type(ev.text.text);
+                break;
             case SDL_EVENT_KEY_DOWN:
-                if (!live || ev.key.repeat) break;
+                if (!live) break;
+                if (g_acct == ACCT_FORM) {  /* typing: letters come as text; here only editing keys */
+                    if (ev.key.key == SDLK_BACKSPACE) in = IN_BACK;
+                    else if (ev.key.repeat) break;
+                    else if (ev.key.key == SDLK_RETURN) in = IN_START;
+                    else if (ev.key.key == SDLK_TAB) in = IN_OPTIONS;
+                    else if (ev.key.key == SDLK_ESCAPE) in = IN_SELECT;
+                    else if (ev.key.key == SDLK_LEFT) in = IN_LEFT;
+                    else if (ev.key.key == SDLK_RIGHT) in = IN_RIGHT;
+                    else if (ev.key.key == SDLK_UP) in = IN_UP;
+                    else if (ev.key.key == SDLK_DOWN) in = IN_DOWN;
+                    break;
+                }
+                if (ev.key.repeat) break;
                 if (ev.key.key == SDLK_LEFT) in = IN_LEFT;
                 else if (ev.key.key == SDLK_RIGHT) in = IN_RIGHT;
                 else if (ev.key.key == SDLK_UP) in = IN_UP;
@@ -559,6 +1168,8 @@ int main(int argc, char **argv) {
                 else if (ev.key.key == SDLK_RETURN) in = IN_PLAY;
                 else if (ev.key.key == SDLK_ESCAPE || ev.key.key == SDLK_BACKSPACE) in = IN_BACK;
                 else if (ev.key.key == SDLK_Y || ev.key.key == SDLK_TAB) in = IN_OPTIONS;
+                else if (ev.key.key == SDLK_X) in = IN_ACH;
+                else if (ev.key.key == SDLK_F2) in = IN_START;
                 break;
             default: break;
             }
@@ -571,6 +1182,7 @@ int main(int argc, char **argv) {
                 else if (r < 0) quit = 1;
             }
         }
+        acct_poll();
         SDL_JoystickID test_dev;
         if (SDL_GetTicks() >= guard && (in = test_key(&test_dev)) != -2) {
             int r = in == -1 ? -1 : in >= 0 && !twin(in, test_dev) ? press(in) : 0;
