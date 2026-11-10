@@ -1,6 +1,6 @@
 /* Debug features for automated testing (docs/phase11-level-tour.md, docs/phase12-gos-level-tour.md).
- * Chains of Olympus (UCUS98653) and Ghost of Sparta (UCUS98737); each game has its own addresses
- * (Game below), and in any other build the options only log that they are not known.
+ * Chains of Olympus (UCUS98653, and UCES00842 in Europe) and Ghost of Sparta (UCUS98737, UCES01401);
+ * each game has its own addresses (Game below), and in any other build the options only log that they are not known.
  *
  *   --warp LEVEL[:SPAWN][@FRAME]
  *                         starts a story game in LEVEL (a file name in disc0:/PSP_GAME/USRDIR/data
@@ -77,6 +77,14 @@ static const Game COO = {
     0x08B3E248u, 0x64u, 0x70u,
 };
 
+/* The European disc: the same code at the same addresses, its data 0x10 bytes further. */
+static const Game COO_EU = {
+    "UCES00842",
+    0x08B3656Cu, 0x08B3CB54u, 0x088347B8u, 0x08B2F278u,
+    0x12Cu, 0x148u, 0xA0u, 0x120u, 0x9Cu, 0x84u,
+    0x08B3E258u, 0x64u, 0x70u,
+};
+
 static const Game GOS = {
     "UCUS98737",
     0x08C17FACu,  /* FUN_002feeac */
@@ -89,19 +97,35 @@ static const Game GOS = {
     0x08C21C08u, 0x64u, 0x70u,  /* found in RAM dumps: 100 / 100 at the start, as in CoO */
 };
 
-#define COO_START_AT_LEVEL 0x08976FE8u  /* FUN_00172fe8(unused, const char *level) */
+/* The European disc: the same code and data, moved (other offsets per part of the EBOOT). */
+static const Game GOS_EU = {
+    "UCES01401",
+    0x08C19574u, 0x08C21980u, 0x088294FCu, 0x08C10BA0u,
+    0x1B4u, 0x1F4u, 0xB0u, 0x130u, 0xACu, 0x80u,
+    0x08C23210u, 0x64u, 0x70u,
+};
 
-#define GOS_FIRST_LEVEL    0x08C061B0u  /* char[64] "att_010_stern" (FUN_002165b8 returns it) */
-#define GOS_MENU_VTABLE    0x08C37350u  /* the main menu screen: +0x14 OnEnter, +0x1C OnExit, +0x4C Update */
+#define COO_START_AT_LEVEL 0x08976FE8u  /* FUN_00172fe8(unused, const char *level); the same in UCES00842 */
+
+/* GoS addresses the warp needs besides Game. */
+typedef struct {
+    uint32_t first_level;   /* char[64] "att_010_stern" (FUN_002165b8 returns it) */
+    uint32_t menu_vtable;   /* the main menu screen: +0x14 OnEnter, +0x1C OnExit, +0x4C Update */
+    uint32_t menu_preload;  /* FUN_00215bd0(menu, const char *level) */
+    uint32_t place_kratos;  /* FUN_000e41e4(game, level, 0): at spawn point game + 0x130 */
+    uint32_t remove_kratos; /* FUN_000e385c(game) */
+    uint32_t difficulty;    /* the New Game menu's choice */
+} GosMenu;
+
+static const GosMenu GOS_MENU = { 0x08C061B0u, 0x08C37350u, 0x08A19BD0u, 0x088E81E4u, 0x088E785Cu, 0x08C0FB24u };
+static const GosMenu GOS_EU_MENU = { 0x08C07758u, 0x08C389E0u, 0x08A1AA04u, 0x088E8210u, 0x088E7888u, 0x08C110C4u };
+
 #define GOS_MENU_STATE     0x7Cu        /* 2 idle, 5 starting the game once the level is loaded, 6 started */
-#define GOS_MENU_PRELOAD   0x08A19BD0u  /* FUN_00215bd0(menu, const char *level) */
-#define GOS_PLACE_KRATOS   0x088E81E4u  /* FUN_000e41e4(game, level, 0): at spawn point game + 0x130 */
-#define GOS_REMOVE_KRATOS  0x088E785Cu  /* FUN_000e385c(game) */
-#define GOS_DIFFICULTY     0x08C0FB24u  /* the New Game menu's choice */
 #define GOS_FLAGS          0x6Cu        /* game: 0x40 a level change is pending, 0x80 a hard one (unload everything) */
 #define GOS_NEXT_LEVEL     0x134u       /* game: char[64], the pending level change's level */
 
 static const Game *g;  /* this build's game, or NULL */
+static const GosMenu *gm;  /* GoS: this disc's menu addresses */
 
 static const char *g_warp, *g_warp_via;
 static uint32_t g_warp_frame = 1000;
@@ -120,10 +144,12 @@ static int g_load_done;
 
 static const Game *game_info(void) {
     if (!strcmp(RT_GAME_ID, COO.id)) return &COO;
-    if (!strcmp(RT_GAME_ID, GOS.id)) return &GOS;
+    if (!strcmp(RT_GAME_ID, COO_EU.id)) return &COO_EU;
+    if (!strcmp(RT_GAME_ID, GOS.id)) { gm = &GOS_MENU; return &GOS; }
+    if (!strcmp(RT_GAME_ID, GOS_EU.id)) { gm = &GOS_EU_MENU; return &GOS_EU; }
     return NULL;
 }
-static int is_coo(void) { return g == &COO; }
+static int is_coo(void) { return g == &COO || g == &COO_EU; }
 
 int rt_debug_option(int argc, char **argv, int *i) {
     const char *a = argv[*i];
@@ -234,28 +260,28 @@ static uint32_t guest_name(const char *s) {
 
 static void warp_coo(void) {
     g_warp_done = 1;
-    uint32_t game = rt_r32(COO.game_ptr);
+    uint32_t game = rt_r32(g->game_ptr);
     if (!game || !k_cur) { rt_log("[debug] --warp: the game object does not exist yet\n"); return; }
     uint32_t name = guest_name(g_warp);
     if (!name) { rt_log("[debug] --warp: no guest memory for the level name\n"); return; }
     rt_log("[debug] warp to %s (thread %s)\n", g_warp, k_cur->name);
     uint32_t args[2] = { 0, name };
     rt_call_guest(&k_cur->ctx, COO_START_AT_LEVEL, 2, args);
-    if (strncmp(g_warp, "cog_", 4)) rt_w32(game + COO.game_mode, 0);  /* story mode, except the challenges */
+    if (strncmp(g_warp, "cog_", 4)) rt_w32(game + g->game_mode, 0);  /* story mode, except the challenges */
     /* the level loads later (the call only queues it), and Kratos is placed at this spawn point then */
-    if (g_warp_spawn >= 0) rt_w32(game + COO.game_spawn, (uint32_t)g_warp_spawn);
+    if (g_warp_spawn >= 0) rt_w32(game + g->game_spawn, (uint32_t)g_warp_spawn);
 }
 
 /* GoS: the main menu screen object (its vtable at +0xC), found in user RAM. */
 static uint32_t gos_find_menu(void) {
     const uint32_t *p = (const uint32_t *)rt_ptr(0x08800000u);
     for (uint32_t k = 3; k < 0x01800000u / 4; k++)
-        if (p[k] == GOS_MENU_VTABLE) return 0x08800000u + 4 * (k - 3);
+        if (p[k] == gm->menu_vtable) return 0x08800000u + 4 * (k - 3);
     return 0;
 }
 
 static uint32_t gos_find_level(const char *want) {
-    uint32_t mgr = rt_r32(GOS.mgr_ptr);
+    uint32_t mgr = rt_r32(g->mgr_ptr);
     if (!ram_ptr(mgr)) return 0;
     char name[64];
     for (uint32_t k = 0, n = rt_r32(mgr + 0x38); k < n && k < 16; k++) {
@@ -268,14 +294,14 @@ static uint32_t gos_find_level(const char *want) {
 /* GoS: LEVEL is loaded, current, and the level the game says Kratos is in. */
 static int gos_in_level(uint32_t game, const char *want) {
     char name[64];
-    uint32_t mgr = rt_r32(GOS.mgr_ptr), lvl = gos_find_level(want);
-    return lvl && rt_r32(mgr + 0x40) == lvl && !strcmp(guest_str(game + GOS.game_level, name, sizeof(name)), want);
+    uint32_t mgr = rt_r32(g->mgr_ptr), lvl = gos_find_level(want);
+    return lvl && rt_r32(mgr + 0x40) == lvl && !strcmp(guest_str(game + g->game_level, name, sizeof(name)), want);
 }
 
 /* GoS --warp, a few steps over several frames: the main menu must be idle (state 2) first, then the
  * menu's own code loads and starts the level; the spawn point is applied once Kratos is in it. */
 static void warp_gos(uint64_t frame) {
-    uint32_t game = rt_r32(GOS.game_ptr);
+    uint32_t game = rt_r32(g->game_ptr);
     const char *first = g_warp_via ? g_warp_via : g_warp;
     if (g_gos_stage == 0) {
         static uint64_t scanned;
@@ -284,15 +310,15 @@ static void warp_gos(uint64_t frame) {
         if (strlen(g_warp) >= 64 || strlen(first) >= 64) { rt_log("[debug] --warp: level name too long\n"); g_warp_done = 1; return; }
         rt_log("[debug] warp to %s%s%s (frame %llu, thread %s, menu %08X, difficulty %u)\n", g_warp,
                g_warp_via ? " via " : "", g_warp_via ? g_warp_via : "", (unsigned long long)frame, k_cur->name, g_gos_menu,
-               rt_r32(GOS_DIFFICULTY));
-        memset(rt_ptr(GOS_FIRST_LEVEL), 0, 64);
-        memcpy(rt_ptr(GOS_FIRST_LEVEL), first, strlen(first));
-        uint32_t args[2] = { g_gos_menu, GOS_FIRST_LEVEL };
-        rt_call_guest(&k_cur->ctx, GOS_MENU_PRELOAD, 2, args);
+               rt_r32(gm->difficulty));
+        memset(rt_ptr(gm->first_level), 0, 64);
+        memcpy(rt_ptr(gm->first_level), first, strlen(first));
+        uint32_t args[2] = { g_gos_menu, gm->first_level };
+        rt_call_guest(&k_cur->ctx, gm->menu_preload, 2, args);
         rt_w32(g_gos_menu + GOS_MENU_STATE, 5);
         /* the start places Kratos at this spawn point (the game reset, FUN_002cf054, keeps it); the
          * level may set it back to 0 as it starts, which step 1 checks */
-        if (g_warp_spawn >= 0 && !g_warp_via) rt_w32(game + GOS.game_spawn, (uint32_t)g_warp_spawn);
+        if (g_warp_spawn >= 0 && !g_warp_via) rt_w32(game + g->game_spawn, (uint32_t)g_warp_spawn);
         g_gos_stage = 1;
         return;
     }
@@ -300,7 +326,7 @@ static void warp_gos(uint64_t frame) {
         if (!gos_in_level(game, first)) return;
         rt_log("[debug] warp: the game started in %s at frame %llu\n", first, (unsigned long long)frame);
         if (g_warp_spawn > 0 && !g_warp_via) {
-            uint32_t got = rt_r32(game + GOS.game_spawn), n = rt_r32(gos_find_level(first) + GOS.level_spawns);
+            uint32_t got = rt_r32(game + g->game_spawn), n = rt_r32(gos_find_level(first) + g->level_spawns);
             if (got == (uint32_t)g_warp_spawn) {
                 rt_log("[debug] warp: spawn point %u of %u\n", got, n);
                 g_warp_done = 1;
@@ -328,16 +354,16 @@ static void warp_gos(uint64_t frame) {
     }
     if (g_gos_stage == 2) {
         uint32_t lvl = gos_find_level(g_warp);
-        if (!lvl || !ram_ptr(rt_r32(game + GOS.game_hero))) return;
-        uint32_t n = rt_r32(lvl + GOS.level_spawns);
+        if (!lvl || !ram_ptr(rt_r32(game + g->game_hero))) return;
+        uint32_t n = rt_r32(lvl + g->level_spawns);
         rt_log("[debug] warp: spawn point %d of %u (Kratos removed and placed again)\n", g_warp_spawn, n);
         /* as the game's own level change does (FUN_000e4bfc): remove Kratos, then place him; placing him
          * without removing him first leaves the old Kratos in memory */
         uint32_t args1[1] = { game };
-        rt_call_guest(&k_cur->ctx, GOS_REMOVE_KRATOS, 1, args1);
-        rt_w32(game + GOS.game_spawn, (uint32_t)g_warp_spawn);
+        rt_call_guest(&k_cur->ctx, gm->remove_kratos, 1, args1);
+        rt_w32(game + g->game_spawn, (uint32_t)g_warp_spawn);
         uint32_t args[3] = { game, lvl, 0 };
-        rt_call_guest(&k_cur->ctx, GOS_PLACE_KRATOS, 3, args);
+        rt_call_guest(&k_cur->ctx, gm->place_kratos, 3, args);
         g_gos_stage = 3;
         g_warp_done = 1;
     }

@@ -64,6 +64,8 @@ typedef struct {
     int show_input;            /* --show-input: the buttons and stick the game reads, bottom left (F2 switches it) */
     int low_power;             /* --gpu-power low: the integrated GPU of a PC with two (default: the fast one) */
     int hud_edges;             /* --hud-edges: wider than 16:9, the HUD at the window's edges (experimental) */
+    int hud_smooth;            /* --smooth-hud (Linux): the 2D pictures drawn on the screen scaled by xBRZ */
+    const char *settings;      /* --settings FILE: what the in-game options menu saves, read back at start (rt_host.c) */
 } GpuOptions;
 extern GpuOptions rt_gpu_opt;  /* read by rt_gpu_init */
 /* parses --res-scale N, --fx-scale N, --msaa N, --aniso N, --lod-bias F, --hdr [auto|scrgb|hdr10],
@@ -76,6 +78,10 @@ int rt_gpu_scale(void);        /* internal resolution scale in use */
 float rt_gpu_aspect_squeeze(void);
 int rt_gpu_shown_fb(uint32_t addr);
 int rt_gpu_capture_full(void); /* frame PNGs come from rt_gpu_read_target_full (higher scale, FXAA, sharpening) */
+/* The in-game options menu: shows the last frame with w x h RGBA pixels over it, centred at a whole scale; the
+ * game waits meanwhile. rt_gpu_options_changed takes rt_gpu_opt's scale, filtering and V-Sync in after the next frame. */
+void rt_gpu_menu_show(const void *rgba, int w, int h);
+void rt_gpu_options_changed(void);
 
 /* window: the SDL_Window to present to, or NULL (headless). driver: "vulkan", "direct3d12" or NULL. */
 int rt_gpu_init(void *window, const char *driver);
@@ -85,6 +91,8 @@ void rt_gpu_shutdown(void);
  * holds the levels one after another, level i being max(1, w >> i) x max(1, h >> i). */
 int rt_gpu_texture_resident(uint64_t key);
 void rt_gpu_texture_upload(uint64_t key, int w, int h, int levels, const uint32_t *rgba);
+/* the same for a texture of a 2D draw on the shown framebuffer (Linux): scaled by xBRZ with --smooth-hud */
+void rt_gpu_texture_upload_hud(uint64_t key, int w, int h, int levels, const uint32_t *rgba);
 /* Does the texture at addr (pitch bytes per row, bpp bytes per pixel) lie in what the GPU drew? */
 int rt_gpu_texture_is_target(uint32_t addr, uint32_t pitch, int bpp);
 /* records a draw of n vertices (a triangle list) */

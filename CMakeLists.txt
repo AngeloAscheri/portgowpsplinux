@@ -52,8 +52,15 @@ if(GOW_WINDOW AND NOT GOW_TOOLS_ONLY)
   set(SDL_STATIC ON CACHE BOOL "" FORCE)
   set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
   set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-  gow_fetch_archive(SDL3 libsdl-org/SDL fa2c02bb6e21974a89ea9824bc53c9932abe5f9c
-    d246967187a4f37cc850608dbaf5cff9d1df4d731259903d25539755cdfcc657)
+  # GOW_SDL3_DIR: an SDL3 already built and installed there (the Linux AppImage brings one: SteamOS has no X11 or
+  # Wayland headers to build it); otherwise the pinned source is built here
+  set(GOW_SDL3_DIR "" CACHE PATH "Prebuilt SDL3 (install prefix); empty: build it from source")
+  if(GOW_SDL3_DIR)
+    find_package(SDL3 CONFIG REQUIRED PATHS "${GOW_SDL3_DIR}" NO_DEFAULT_PATH)
+  else()
+    gow_fetch_archive(SDL3 libsdl-org/SDL fa2c02bb6e21974a89ea9824bc53c9932abe5f9c
+      d246967187a4f37cc850608dbaf5cff9d1df4d731259903d25539755cdfcc657)
+  endif()
 endif()
 
 # ATRAC3/ATRAC3+ decoder for sceAtrac3plus: PPSSPP's ext/at3_standalone (FFmpeg's decoders
@@ -236,9 +243,42 @@ add_executable(gow_rt
 set_target_properties(gow_rt PROPERTIES OUTPUT_NAME "gow_rt_${GAME}" C_STANDARD 11)
 target_include_directories(gow_rt PRIVATE runtime "${GEN_DIR}")
 target_link_libraries(gow_rt PRIVATE chdr-static at3_standalone openh264_dec libkirk)
+
+# "Smooth HUD" (Linux): PPSSPP's xBRZ (GPL-3.0) from tag v1.20.4, checked by SHA-256, scales the 2D
+# pictures drawn on the screen (rt_gpu.c, rt_xbrz.cpp)
+if(UNIX AND NOT APPLE)
+  set(XBRZ_DIR "${GOW_DEPS_DIR}/xbrz")
+  fetch_pinned_files(xbrz "${XBRZ_DIR}" "https://raw.githubusercontent.com/hrydgard/ppsspp/v1.20.4/ext/xbrz"
+    "config.h=bbb7d3ab1c25851673a71c126188cc1f02dc483819f04af8a8241dac71e9fe1a;xbrz.h=f0c59293edf8268abe7e749f017fe84c9ae38303aef2afc3244b2fdba9aeb69c;xbrz.cpp=35283301d48ff518c8394c674195d086325697a51bf4d72213e636f1df213c7e"
+    XBRZ_SOURCES)
+  add_library(xbrz STATIC ${XBRZ_SOURCES} runtime/rt_xbrz.cpp)
+  target_include_directories(xbrz PRIVATE "${XBRZ_DIR}" runtime/xbrzshim)
+  set_target_properties(xbrz PROPERTIES CXX_STANDARD 17)
+  target_compile_options(xbrz PRIVATE -O2 -w)
+  target_link_libraries(gow_rt PRIVATE xbrz)
+  target_compile_definitions(gow_rt PRIVATE GOW_HAVE_XBRZ)
+endif()
 if(GOW_WINDOW)
   target_link_libraries(gow_rt PRIVATE SDL3::SDL3-static)
   target_compile_definitions(gow_rt PRIVATE GOW_HAVE_SDL)
+endif()
+
+# The gamepad game picker for Steam's Game Mode (Linux only; the Windows launcher does this job there)
+if(GOW_WINDOW AND UNIX AND NOT APPLE)
+  # Its text: the launcher's Cinzel (OFL), built into the program, drawn with stb_truetype (public domain)
+  set(STB_DIR "${GOW_DEPS_DIR}/stb")
+  fetch_pinned_files(stb "${STB_DIR}" "https://raw.githubusercontent.com/nothings/stb/6e9f34d5429cf16790ec43c9bac3f1ee4ad1f760"
+    "stb_truetype.h=ecd30b05e0dd4fea3a13c26810dd9e1992dc379049482c393d5a19e6b5090aab" STB_SOURCES)
+  set(MENU_FONT "${CMAKE_CURRENT_SOURCE_DIR}/tools/launcher_assets/Cinzel[wght].ttf")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MENU_FONT}")
+  file(READ "${MENU_FONT}" font_hex HEX)
+  string(REGEX REPLACE "(..)" "0x\\1," font_hex "${font_hex}")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gow_menu_font.h"
+    "/* generated from tools/launcher_assets/Cinzel[wght].ttf */\nstatic const unsigned char MENU_FONT[] = {${font_hex}};\n")
+  add_executable(gow_menu runtime/gow_menu.c)
+  set_target_properties(gow_menu PROPERTIES C_STANDARD 11)
+  target_include_directories(gow_menu PRIVATE runtime "${STB_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+  target_link_libraries(gow_menu PRIVATE SDL3::SDL3-static)
 endif()
 
 if(MSVC)

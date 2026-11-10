@@ -412,9 +412,57 @@ def install(missing, out=print):
     return True
 
 
+LINUX = sys.platform.startswith("linux")
+LINUX_TOOLS = (("cc", ("clang", "cc")), ("cxx", ("clang++", "c++")), ("cmake", ("cmake",)), ("ninja", ("ninja", "ninja-build")))
+
+
+def find_linux():
+    """Linux: {tool: path or None} for the system's C and C++ compilers, CMake and Ninja (the AppImage of phase 8 will
+    bring its own)."""
+    sim = simulated_missing()
+    return {k: None if k in sim or "all" in sim else next((p for p in map(shutil.which, names) if p), None) for k, names in LINUX_TOOLS}
+
+
+def appimage_tools(root):
+    """The AppImage's own tools (GOW_APPDIR/usr/lib/gow-psp: Zig, CMake, Ninja, a prebuilt SDL3). CMake keeps the
+    compiler's path, and the AppImage is mounted in a new folder every time: the compilers and Ninja are small scripts
+    in root that find the AppImage through GOW_APPDIR when they run; SDL3 (10 MB) is copied into root."""
+    lib = Path(os.environ["GOW_APPDIR"]) / "usr" / "lib" / "gow-psp"
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    scripts = {"zcc": 'zig/zig" cc -target x86_64-linux-gnu.2.38', "zcxx": 'zig/zig" c++ -target x86_64-linux-gnu.2.38',
+               "ninja": 'ninja/ninja"'}
+    for name, cmd in scripts.items():
+        f = root / name
+        text = f'#!/bin/sh\nexec "$GOW_APPDIR/usr/lib/gow-psp/{cmd} "$@"\n'
+        if not f.exists() or f.read_text() != text:
+            f.write_text(text)
+            f.chmod(0o755)
+    stamp = (lib / "sdl3" / "VERSION").read_text() if (lib / "sdl3" / "VERSION").exists() else "?"
+    if not (root / "sdl3" / "VERSION").exists() or (root / "sdl3" / "VERSION").read_text() != stamp:
+        shutil.rmtree(root / "sdl3", ignore_errors=True)
+        shutil.copytree(lib / "sdl3", root / "sdl3")
+    return {"kind": "linux", "cc": str(root / "zcc"), "cxx": str(root / "zcxx"), "cmake": str(lib / "cmake" / "bin" / "cmake"),
+            "ninja": str(root / "ninja"), "sdl3": str(root / "sdl3"), "python": sys.executable, "env": dict(os.environ)}
+
+
+def ensure_linux(out=print, root=None):
+    if os.environ.get("GOW_APPDIR") and root is not None:
+        return appimage_tools(root)
+    found = find_linux()
+    missing = [k for k, p in found.items() if not p]
+    if missing:
+        out(ERROR + "building needs a C/C++ compiler (Clang), CMake and Ninja; not found: " + ", ".join(missing)
+            + ". On an immutable system (Bazzite, SteamOS) build inside a container (docs/linux.md).")
+        return None
+    return dict(found, kind="linux", python=sys.executable, env=dict(os.environ))
+
+
 def ensure(ask, out=print, root=None):
     """The tools for a build: the portable toolchain under root (downloaded once after ask(text) -> bool), or Visual
-    Studio (GOW_TOOLCHAIN, see the top). Returns a dict (cmake, python, kind, ...) or None."""
+    Studio (GOW_TOOLCHAIN, see the top); on Linux the system's. Returns a dict (cmake, python, kind, ...) or None."""
+    if LINUX:
+        return ensure_linux(out, root)
     m = mode()
     msvc = detect()
     has_msvc = all(msvc.values())
@@ -467,6 +515,6 @@ def ask_console(text):
 
 
 if __name__ == "__main__":
-    for tool, path in detect().items():
+    for tool, path in (find_linux() if LINUX else detect()).items():
         print(f"{tool:7} {path or 'MISSING'}")
     print(f"winget  {find_winget() or 'MISSING'}")

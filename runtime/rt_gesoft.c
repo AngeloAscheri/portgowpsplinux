@@ -1633,7 +1633,15 @@ static uint64_t gpu_texture(int *levels) {
             for (int y = 0; y < R.th[l]; y++)
                 for (int x = 0; x < R.tw[l]; x++) *o++ = fetch(rs, l, x, y);
         R.clut = saved;
+#ifdef __linux__
+        /* a 2D draw on the shown framebuffer (HUD, text, icons), in through mode or (Chains of Olympus's HUD) with an
+         * orthographic projection and no depth test: --smooth-hud scales its texture */
+        int flat = R.through || (ge.proj[3] == 0 && ge.proj[7] == 0 && ge.proj[11] == 0 && ge.proj[15] == 1 && !(D(GE_CMD_ZTESTENABLE) & 1));
+        if (flat && rt_gpu_shown_fb(VRAM | (D(GE_CMD_FRAMEBUFPTR) & 0x1FFFF0))) rt_gpu_texture_upload_hud(key, w, h, nl, g_decode);
+        else rt_gpu_texture_upload(key, w, h, nl, g_decode);
+#else
         rt_gpu_texture_upload(key, w, h, nl, g_decode);
+#endif
     }
     return key;
 }

@@ -9,6 +9,12 @@ in build/launcher.json (your paths stay on your machine; build/ is not in git).
     python tools/launcher.pyw --play coo|gos      start with the saved settings
     python tools/launcher.pyw --print-command coo|gos
     python tools/launcher.pyw --check-tools       show which build tools were found
+    python tools/launcher.pyw --scan-roms         Linux: find the discs in roms/ and ~/.local/share/gow-psp/roms/
+                                                  (also coo_eu and gos_eu for the European discs)
+    python tools/launcher.pyw --menu              Linux: the game picker with the games built (what Steam starts)
+    python tools/launcher.pyw --add-to-steam      Linux: with Steam closed, add "God of War PSP" (the picker) to Steam
+    python tools/launcher.pyw --install           Linux: all of it: find the discs, build, add to Steam (the AppImage
+                                                  does this when opened without arguments)
 
 Building needs a C/C++ toolchain and CMake. By default the launcher downloads a portable one once (llvm-mingw, CMake,
 Ninja; pinned SHA-256, after asking) into build/toolchain and builds with it into build/mingw_*; Visual Studio's C++
@@ -41,7 +47,16 @@ def data_root():
     return exe_dir / DATA_DIR
 
 
-ROOT = data_root() if FROZEN else Path(__file__).resolve().parent.parent
+# Linux AppImage (packaging/linux): AppRun sets GOW_APPDIR; the sources it carries are copied into a writable folder,
+# ~/.local/share/gow-psp/work, which then plays the part of the repository (builds, settings, logs)
+APPDIR = Path(os.environ["GOW_APPDIR"]) if sys.platform.startswith("linux") and os.environ.get("GOW_APPDIR") else None
+BUNDLED_SRC = Path(sys._MEIPASS) / "src" if FROZEN else APPDIR / "usr" / "share" / "gow-psp" / "src" if APPDIR else None
+if FROZEN:
+    ROOT = data_root()
+elif APPDIR:
+    ROOT = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "gow-psp" / "work"
+else:
+    ROOT = Path(__file__).resolve().parent.parent
 CONFIG = Path(os.environ.get("GOW_LAUNCHER_CONFIG") or ROOT / "build" / "launcher.json")
 GAMES = {
     "coo": {"id": "UCUS98653", "title": "God of War: Chains of Olympus", "build": "build/cmake_full", "ms0": "build/ms0"},
@@ -72,6 +87,28 @@ CONTROLS = {
 PAD_BUTTONS = ["a", "b", "x", "y", "leftshoulder", "rightshoulder", "lefttrigger", "righttrigger", "back", "start",
                "dpup", "dpdown", "dpleft", "dpright", "leftstick", "rightstick"]
 RESERVED_KEYS = {"Escape", "F11", "F12", "F3", "F2", "F4"}  # quit box, fullscreen, screenshot, frame rate, buttons, Alt+F4
+
+# Linux (docs/linux.md): the European discs too, as games of their own; saves and the in-game options per game in
+# ~/.local/share/gow-psp/<game>/; the discs in roms/ (ROMS_DIRS)
+LINUX = sys.platform.startswith("linux")
+EXE = "" if LINUX else ".exe"
+if LINUX:
+    DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "gow-psp"
+    GAMES.update({
+        "coo_eu": {"id": "UCES00842", "title": "God of War: Chains of Olympus (Europe)", "build": "build/linux_coo_eu"},
+        "gos_eu": {"id": "UCES01401", "title": "God of War: Ghost of Sparta (Europe)", "build": "build/linux_gos_eu"},
+    })
+    for _k, _g in GAMES.items():
+        _g["build"] = f"build/linux_{_k}"
+        _g["ms0"] = str(DATA_HOME / _k / "ms0")
+    ROMS_DIRS = [ROOT / "roms", DATA_HOME / "roms"]
+    if APPDIR:  # a roms/ folder next to the AppImage file, then ~/.local/share/gow-psp/roms
+        ROMS_DIRS = ([Path(os.environ["APPIMAGE"]).parent / "roms"] if os.environ.get("APPIMAGE") else []) + [DATA_HOME / "roms"]
+    # what the picker (gow_menu.c) shows for an option its game never saved: x4, V-Sync on; the system's language when
+    # the discs know it (the game falls back to English on a disc without it, as on a PSP)
+    _lang = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "en")[:2].lower()
+    DEFAULTS.update(res_scale=4, vsync=True, language=_lang if _lang in ("en", "fr", "es") else "en")
+    ROM_FOLDERS = {"chains-of-olympus": ("coo", "coo_eu"), "ghost-of-sparta": ("gos", "gos_eu")}
 
 
 def controls_of(cfg):
@@ -225,6 +262,8 @@ FLAVOURS = {
     "portable": {"tools": "build/mingw_tools", "coo": "build/mingw_full", "gos": "build/mingw_gos_full", "sub": ""},
     "msvc": {"tools": "build/cmake_tools", "coo": "build/cmake_full", "gos": "build/cmake_gos_full", "sub": "Release"},
 }
+if LINUX:  # the system's tools (toolchain.ensure_linux), one Ninja build per game
+    FLAVOURS = {"linux": dict({k: g["build"] for k, g in GAMES.items()}, tools="build/linux_tools", sub="")}
 TOOLCHAIN_DIR = ROOT / "build" / "toolchain"
 
 
@@ -244,8 +283,8 @@ def runtime_stamp():
     A game built from other sources may not know the options this launcher passes (v1.3.0 added --rumble, on by
     default: a v1.2 build stopped at once with "unknown argument"), so it must be built again first."""
     h = hashlib.sha256()
-    if FROZEN:
-        h.update((Path(sys._MEIPASS) / "src" / "manifest.txt").read_bytes())
+    if BUNDLED_SRC:
+        h.update((BUNDLED_SRC / "manifest.txt").read_bytes())
     else:
         for p in sorted((ROOT / "runtime").rglob("*")) + [ROOT / "CMakeLists.txt"]:
             if p.is_file():
@@ -266,17 +305,22 @@ def build_is_current(game):
 
 
 def exe_path(game):
-    return newest([built_file(k, game, f"gow_rt_{GAMES[game]['id']}_full.exe") for k in FLAVOURS])
+    return newest([built_file(k, game, f"gow_rt_{GAMES[game]['id']}_full{EXE}") for k in FLAVOURS])
 
 
 def disc_tool():
-    return newest([built_file(k, "tools", "gow_disc.exe") for k in FLAVOURS])
+    return newest([built_file(k, "tools", f"gow_disc{EXE}") for k in FLAVOURS])
 
 
 def configure_args(tools):
     """Extra CMake configure arguments for this toolchain. Git is never used (sources are pinned archives) and is
     hidden from CMake, so a Git that happens to be installed can't mask a regression (tools/check_no_git.py)."""
     no_git = ["-DCMAKE_DISABLE_FIND_PACKAGE_Git=ON"]
+    if tools.get("kind") == "linux":  # glibc from the system; the C++ runtime inside, so the game runs elsewhere too
+        return no_git + ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_MAKE_PROGRAM={tools['ninja']}",
+                         f"-DCMAKE_C_COMPILER={tools['cc']}", f"-DCMAKE_CXX_COMPILER={tools['cxx']}",
+                         "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"] + \
+            ([f"-DGOW_SDL3_DIR={tools['sdl3']}"] if tools.get("sdl3") else [])
     if tools.get("kind") != "portable":
         return no_git
     return no_git + ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_MAKE_PROGRAM={tools['ninja']}",
@@ -288,11 +332,12 @@ def gen_dir(game):
 
 
 def unpack_sources(out=print):
-    """Frozen only: copies the bundled sources (CMakeLists.txt, runtime/, cmake/, re/out tables) next to the exe
-    when they are missing or from another launcher version."""
-    if not FROZEN:
+    """Frozen or AppImage only: copies the bundled sources (CMakeLists.txt, runtime/, cmake/, re/out tables; in the
+    AppImage also recomp/ and the pinned third-party sources) into ROOT when they are missing or from another
+    launcher version."""
+    if not BUNDLED_SRC:
         return
-    src = Path(sys._MEIPASS) / "src"
+    src = BUNDLED_SRC
     manifest = (src / "manifest.txt").read_text(encoding="utf-8")
     stamp = ROOT / "build" / "launcher_sources.txt"
     if stamp.exists() and stamp.read_text(encoding="utf-8") == manifest:
@@ -404,6 +449,8 @@ def play_command(cfg, game):
         cmd.append("--rumble")
     if cfg.get("confirm_circle"):
         cmd += ["--confirm", "circle"]
+    if LINUX:  # the in-game options menu keeps its choices per game
+        cmd += ["--settings", str(DATA_HOME / game / "settings.ini")]
     return cmd
 
 
@@ -606,6 +653,102 @@ def scan_folder(folder, out=print):
     return found
 
 
+def scan_roms(cfg, out=print):
+    """Linux: the discs in the roms folders (ROMS_DIRS), by disc ID, into cfg["disc"]; says when a disc is in another
+    game's folder. Returns {game: path}."""
+    found = {}
+    for base in ROMS_DIRS:
+        if not base.is_dir():
+            continue
+        out(f"looking in {base}")
+        for game, path in scan_folder(base, out).items():
+            folder = Path(path).parent.name
+            if folder in ROM_FOLDERS and game not in ROM_FOLDERS[folder]:
+                out(f"{Path(path).name} is {GAMES[game]['title']}, but it is in {folder}/: it works, though it belongs in "
+                    f"{next(f for f, g in ROM_FOLDERS.items() if game in g)}/")
+            found.setdefault(game, path)
+    for game, path in found.items():
+        cfg["disc"][game] = path
+        out(f"{game}: {path}")
+    if not found:
+        out("no disc found; put your .iso or .chd in " + " or ".join(str(d) for d in ROMS_DIRS))
+    return found
+
+
+MENU_TITLES = {"coo": "Chains of Olympus", "gos": "Ghost of Sparta"}
+
+
+def menu_games(cfg):
+    """Linux: per game, the disc to show in the picker: the one chosen in cfg["prefer"] (e.g. {"coo": "coo_eu"} for
+    Spanish), else the US one, else the European one; the first of those that is built and has its disc."""
+    out = []
+    for base in MENU_TITLES:
+        keys = [base, base + "_eu"]
+        pref = (cfg.get("prefer") or {}).get(base)
+        order = ([pref] if pref in keys else []) + [k for k in keys if k != pref]
+        ready = [k for k in order if exe_path(k).exists() and Path(cfg["disc"].get(k, "") or "/").is_file()]
+        out.append((base, ready[0] if ready else None))
+    return out
+
+
+def menu_command(cfg):
+    """Linux: the gow_menu command line (and writes the scripts it starts, one per game: gow_menu runs a program
+    without arguments). A game with nothing built shows as unavailable."""
+    menu = newest([ROOT / g["build"] / "gow_menu" for g in GAMES.values()])
+    launch = DATA_HOME / "launch"
+    launch.mkdir(parents=True, exist_ok=True)
+    python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
+    cmd = [str(menu)]
+    for base, game in menu_games(cfg):
+        key = game or base
+        script = launch / f"play_{key}.sh"
+        if game:
+            run = f'"{os.environ.get("APPIMAGE") or APPDIR / "AppRun"}"' if APPDIR else f'"{python}" "{Path(__file__).resolve()}"'
+            script.write_text(f'#!/bin/sh\nexec {run} --play {game}\n', encoding="utf-8")
+            script.chmod(0o755)
+            art = extract_art(game, cfg["disc"][game]).get("PIC1.PNG", "")
+        else:
+            art = ""
+        cmd += ["--entry", MENU_TITLES[base], str(art), str(script), "--settings", str(DATA_HOME / key / "settings.ini")]
+    return cmd
+
+
+def run_menu(cfg):
+    """Linux: the game picker, as Steam starts it (--menu); its output goes to ~/.local/share/gow-psp/menu.log."""
+    cmd = menu_command(cfg)
+    env = dict(os.environ)
+    if env.get("SteamGameId") and env.get("DISPLAY"):  # see start_game
+        env["SDL_VIDEODRIVER"] = "x11"
+    with open(DATA_HOME / "menu.log", "a", encoding="utf-8", errors="replace") as log:
+        return subprocess.run(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
+
+
+def install(cfg, out=print):
+    """Linux (--install, and the AppImage opened without arguments): finds the discs, builds the games that need it and,
+    with Steam closed, adds "God of War PSP" to Steam. Returns True when at least one game is ready."""
+    if not ensure_disc_tool(out):
+        return False
+    found = scan_roms(cfg, out)
+    save_config(cfg)
+    ready = []
+    for game in found:
+        if exe_path(game).exists() and build_is_current(game):
+            out(f"{game}: already built")
+        elif not run_build(cfg, game, out):
+            out(toolchain.ERROR + f"{game}: the build failed (log above)")
+            continue
+        ready.append(game)
+    if not ready:
+        return False
+    import steam_shortcuts
+    try:
+        f, backup, state = add_to_steam("coo")
+        out(f'{state} "{shortcut_name("coo")}" in Steam: open it from the library (Game Mode or Big Picture)')
+    except steam_shortcuts.SteamError as e:
+        out(f"Steam: {e}")
+    return True
+
+
 def art_dir(game):
     return ROOT / "build" / "launcher" / game
 
@@ -621,7 +764,7 @@ def extract_art(game, disc):
     return {n: d / n for n in ("PIC1.PNG", "ICON0.PNG") if (d / n).exists()}
 
 
-MENU_FRAMES = {"coo": 1200, "gos": 1500}  # the main menu, idle, after a boot with an empty ms0
+MENU_FRAMES = {"coo": 1200, "gos": 1500, "coo_eu": 1200, "gos_eu": 1500}  # the main menu, idle, after a boot with an empty ms0
 MENU_LOOP = 48  # frames rendered for the background loop, every 4th
 
 
@@ -666,7 +809,7 @@ def build_steps(cfg, game, tools=None):
     eboot = eboot_path(game)
     stamp = gen_dir(game) / "eboot.sha256"
     steps = []
-    dt = disc_tool() if disc_tool().exists() else built_file(tools.get("kind", "msvc"), "tools", "gow_disc.exe")
+    dt = disc_tool() if disc_tool().exists() else built_file(tools.get("kind", "msvc"), "tools", f"gow_disc{EXE}")
     if not dt.exists():
         steps += [(cmd, None) for cmd in disc_tool_steps(tools)]
     steps.append(([str(dt), "--disc", disc, "--id", "--decrypt-eboot", str(eboot)], None))
@@ -728,7 +871,7 @@ def build_with(cfg, game, tools, out=print):
             if why:
                 out(toolchain.ERROR + why)
             return False
-        if cmd[0].endswith("gow_disc.exe") and (not lines or lines[0].strip() != GAMES[game]["id"]):
+        if cmd[0].endswith(f"gow_disc{EXE}") and (not lines or lines[0].strip() != GAMES[game]["id"]):
             out(toolchain.ERROR + f"this disc image is {lines[0].strip() if lines else 'unknown'}, not {GAMES[game]['id']} "
                 f"({GAMES[game]['title']})")
             return False
@@ -755,8 +898,12 @@ def start_game(cfg, game):
     # every Play also records the button presses (a few KB) and each frame's timings, so a bug report can include
     # them without a command line
     cmd = play_command(cfg, game) + ["--record-input", str(game_input_log(game)), "--perf-csv", str(game_perf_log(game))]
+    env = None
+    if LINUX and os.environ.get("SteamGameId") and os.environ.get("DISPLAY"):
+        # from Steam on a Wayland desktop, a native Wayland window got another app's Steam Input layout: use XWayland
+        env = dict(os.environ, SDL_VIDEODRIVER="x11")
     proc = subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=env)
     if cfg.get("discord"):  # "Playing <title>" on Discord while the game runs (off by default)
         import discord_presence
         discord_presence.show_while_running(proc, GAMES[game]["title"])
@@ -916,13 +1063,21 @@ def shortcut_target(game):
     if FROZEN:
         exe = Path(sys.executable).resolve()
         return str(exe), f"--play {game}", str(exe.parent)
+    if LINUX and APPDIR:  # the AppImage file itself (APPIMAGE, set by its runtime), or AppRun when run unpacked
+        return os.environ.get("APPIMAGE") or str(APPDIR / "AppRun"), "--menu", str(DATA_HOME)
+    if LINUX:  # one shortcut for both games: the picker (--menu)
+        python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
+        return python, f'"{Path(__file__).resolve()}" --menu', str(ROOT)
     py = Path(sys.executable)
     pyw = py.with_name("pythonw.exe") if py.with_name("pythonw.exe").exists() else py
     return str(pyw), f'"{Path(__file__).resolve()}" --play {game}', str(ROOT)
 
 
 def game_icon(game):
-    """An .ico of the game's own icon (ICON0.PNG off the player's disc) for shortcuts, else the launcher's."""
+    """An .ico of the game's own icon (ICON0.PNG off the player's disc) for shortcuts, else the launcher's; on Linux
+    the launcher's PNG (Steam takes PNG there, and the shortcut is the picker's)."""
+    if LINUX:
+        return str(Path(__file__).resolve().parent / "launcher_assets" / "icon.png")
     png, ico = art_dir(game) / "ICON0.PNG", art_dir(game) / "icon.ico"
     if png.exists() and not ico.exists():
         try:
@@ -940,6 +1095,8 @@ def game_icon(game):
 
 
 def shortcut_name(game):
+    if LINUX:  # the shortcut opens the picker, for both games
+        return "God of War PSP"
     return GAMES[game]["title"].replace(":", " -")
 
 
@@ -964,7 +1121,22 @@ def add_to_steam(game):
     """Adds the game to Steam as a non-Steam game (see steam_shortcuts.py). Returns (vdf, backup, state)."""
     import steam_shortcuts
     exe, args, start = shortcut_target(game)
-    return steam_shortcuts.add_shortcut(shortcut_name(game), exe, args, start, game_icon(game))
+    result = steam_shortcuts.add_shortcut(shortcut_name(game), exe, args, start, game_icon(game))
+    if LINUX:
+        steam_art(result[0].parent / "grid", steam_shortcuts.shortcut_appid(f'"{exe}"', shortcut_name(game)))
+    return result
+
+
+def steam_art(grid, appid):
+    """Linux: the library pictures of the shortcut (capsules, background, logo), made by gow_menu --steam-art from the
+    card art of the games in the picker; nothing when no game has its disc yet."""
+    cfg = load_config()
+    arts = [str(a) for _, g in menu_games(cfg) if g for a in [extract_art(g, cfg["disc"][g]).get("PIC1.PNG")] if a]
+    menu = newest([ROOT / g["build"] / "gow_menu" for g in GAMES.values()])
+    if not arts or not menu.exists():
+        return
+    grid.mkdir(parents=True, exist_ok=True)
+    subprocess.run([str(menu), "--steam-art", str(grid), str(appid & 0xFFFFFFFF)] + arts, capture_output=True, timeout=60)
 
 
 def cli_streams():
@@ -1048,6 +1220,31 @@ def main(argv):
             print(f"check failed: {e}")
             return 1
         print(f"v{info['version']} available: {info['page']}" if info else f"up to date (v{VERSION})")
+        return 0
+    if argv == ["--check-tools"] and LINUX:
+        found = toolchain.find_linux()
+        for tool, path in found.items():
+            print(f"{tool:7} {path or 'MISSING'}")
+        return 0 if all(found.values()) else 1
+    if argv == ["--scan-roms"] and LINUX:
+        cfg = load_config()
+        if not ensure_disc_tool():
+            return 1
+        found = scan_roms(cfg)
+        save_config(cfg)
+        return 0 if found else 1
+    if argv == ["--menu"] and LINUX:
+        return run_menu(load_config())
+    if (argv == ["--install"] or (not argv and APPDIR)) and LINUX:
+        return 0 if install(load_config()) else 1
+    if argv == ["--add-to-steam"] and LINUX:  # with Steam closed: one shortcut, "God of War PSP", that opens the picker
+        import steam_shortcuts
+        try:
+            f, backup, state = add_to_steam("coo")
+        except steam_shortcuts.SteamError as e:
+            print(e)
+            return 1
+        print(f"{state} \"{shortcut_name('coo')}\" in {f}" + (f" (copy of the old file: {backup.name})" if backup else ""))
         return 0
     if argv == ["--check-tools"]:
         msvc, portable = toolchain.detect(), toolchain.find_portable(TOOLCHAIN_DIR)

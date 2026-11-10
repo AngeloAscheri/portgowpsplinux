@@ -1,0 +1,10 @@
+#!/bin/sh
+# God of War PSP (native port) AppImage: the launcher, tools/launcher.pyw, with the system's Python 3. Opened without
+# arguments it finds the discs, builds the games and adds "God of War PSP" to Steam (launcher.pyw --install).
+HERE="$(dirname "$(readlink -f "$0")")"
+export GOW_APPDIR="$HERE"
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "God of War PSP needs python3 (Bazzite and SteamOS bring it)" >&2
+    exit 1
+fi
+exec python3 -I "$HERE/usr/share/gow-psp/src/tools/launcher.pyw" "$@"

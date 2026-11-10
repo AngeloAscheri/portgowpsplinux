@@ -298,6 +298,11 @@ static int run_boot(const BootOptions *o) {
     KThread *t = k_thread_create("module_start", RT_ENTRY, prio, stack, attr);
     printf("[boot] module_start thread: prio %u, stack %X, attr %08X\n", prio, stack, attr);
     k_thread_start(t, sizeof(path), argp);
+#ifdef __linux__
+    /* the arguments now sit on the thread's stack (k_thread_start): free their block, so that the game's first
+     * allocation lands right after the image as on a PSP (PPSSPP), where RetroAchievements' sets look for it */
+    k_free(argp);
+#endif
 #ifdef _WIN32
     g_prev_filter = SetUnhandledExceptionFilter(on_crash);  /* before the window and GPU start: drivers crash there too */
     if (o->host.window) prefer_fast_cores();

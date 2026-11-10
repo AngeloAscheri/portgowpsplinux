@@ -3,10 +3,29 @@
 *.iso
 *.cso
 *.pbp
+# Linux tells upper from lower case, Windows doesn't: the patterns above miss GAME.ISO here
+*.[cC][hH][dD]
+*.[iI][sS][oO]
+*.[cC][sS][oO]
+*.[pP][bB][pP]
+*.[pP][rR][xX]
+EBOOT.BIN
+*_EBOOT.BIN
+image.bin
+PIC1.PNG
+ICON0.PNG
+ms0/
 re/dumps/
 re/out/recomp/*.bin
 re/out/*.vfpu.tsv
 build/
+# Your own discs go in roms/<game>/ (roms/README.txt): git keeps only the folders and their notes
+roms/**
+!roms/*/
+!roms/README.txt
+!roms/LEEME.txt
+!roms/*/README.txt
+!roms/*/LEEME.txt
 
 # Ghidra project (holds the complete analyzed programs)
 re/ghidra/

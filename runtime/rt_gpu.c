@@ -52,6 +52,7 @@ int rt_gpu_option(int argc, char **argv, int *i) {
     if (!strcmp(a, "--show-fps")) { o->show_fps = 1; return 1; }
     if (!strcmp(a, "--show-input")) { o->show_input = 1; return 1; }
     if (!strcmp(a, "--hud-edges")) { o->hud_edges = 1; return 1; }
+    if (!strcmp(a, "--smooth-hud")) { o->hud_smooth = 1; return 1; }
     if (!strcmp(a, "--hdr")) {
         o->hdr = 1;
         if (v && (!strcmp(v, "scrgb") || !strcmp(v, "hdr10") || !strcmp(v, "auto"))) {
@@ -72,6 +73,7 @@ int rt_gpu_option(int argc, char **argv, int *i) {
     else if (!strcmp(a, "--fps")) o->fps = (float)atof(v);
     else if (!strcmp(a, "--texture-dump")) o->texture_dump = v;
     else if (!strcmp(a, "--texture-pack")) o->texture_pack = v;
+    else if (!strcmp(a, "--settings")) o->settings = v;
     else if (!strcmp(a, "--gpu-power")) o->low_power = !strcmp(v, "low");
     else if (!strcmp(a, "--aspect")) {  /* W:H or a number */
         const char *colon = strchr(v, ':');
@@ -115,7 +117,7 @@ typedef struct {
     int stencil_dirty;         /* stencil written since its values were last copied into the alpha channel */
     int want_s;                /* scale to change to after the frame (0: none) */
 } Target;
-typedef struct { uint64_t key; SDL_GPUTexture *tex; int w, h; uint64_t used; int levels, replaced, lod_shift; } TexEntry;
+typedef struct { uint64_t key; SDL_GPUTexture *tex; int w, h; uint64_t used; int levels, replaced, lod_shift, smooth; } TexEntry;
 typedef struct { uint64_t key; SDL_GPUGraphicsPipeline *p; } Pipe;
 typedef struct { uint32_t key; SDL_GPUSampler *s; } Samp;
 /* pooled textures: render-to-texture snapshots, staging for scaled uploads */
@@ -152,6 +154,9 @@ static SDL_GPUShader *g_vs, *g_fs, *g_post_vs, *g_post_fs;
 static SDL_GPUTextureFormat g_dsfmt, g_swfmt;
 static SDL_GPUSampleCount g_sc = SDL_GPU_SAMPLECOUNT_1;
 static int g_scale = 1, g_fx_scale = 1, g_samples = 1;
+#if defined(__linux__) && defined(GOW_HAVE_XBRZ)
+static int g_tex_flush, g_smooth_at_init;  /* --smooth-hud: start the textures afresh; the option at start */
+#endif
 static int g_hdr_out;  /* 0 SDR, 1 scRGB, 2 HDR10 */
 static float g_paper = 200.0f, g_peak = 1000.0f;
 static Samp g_samps[MAX_SAMPLERS];
@@ -195,7 +200,7 @@ static int g_xfer_gpu;  /* the block transfer in progress was made on the GPU */
 static struct {
     uint64_t frames, draws, merged, verts, passes, uploads, upload_bytes, pipelines, targets, snapshots, target_uploads, gpu_copies,
         readbacks, submits, resolves, fills, gpu_wait_ns, gpu_wait_max, acquire_ns, acquire_max, acquire_slow, msaa_resolves,
-        unresolves, blits, snap_bytes, dumped, replaced, pack_loads;
+        unresolves, blits, snap_bytes, dumped, replaced, pack_loads, smoothed;
 } g_st;
 
 static void grow(void **p, size_t *cap, size_t need, size_t elem) {
@@ -297,7 +302,9 @@ static SDL_GPUSampler *make_sampler(SDL_GPUFilter f) {
 }
 
 /* swapchain: present mode, and HDR when asked for and the display shows it */
+static int g_swap_vsync;  /* the V-Sync setting of the swapchain in use */
 static void setup_swapchain(void) {
+    g_swap_vsync = rt_gpu_opt.vsync;
     SDL_GPUPresentMode pm = rt_gpu_opt.vsync ? SDL_GPU_PRESENTMODE_VSYNC
                           : SDL_WindowSupportsGPUPresentMode(g_dev, g_win, SDL_GPU_PRESENTMODE_MAILBOX) ? SDL_GPU_PRESENTMODE_MAILBOX
                           : SDL_WindowSupportsGPUPresentMode(g_dev, g_win, SDL_GPU_PRESENTMODE_IMMEDIATE) ? SDL_GPU_PRESENTMODE_IMMEDIATE
@@ -375,6 +382,9 @@ int rt_gpu_init(void *window, const char *driver) {
     /* graphics options */
     GpuOptions *o = &rt_gpu_opt;
     g_scale = o->res_scale < 1 ? 1 : o->res_scale > 8 ? 8 : o->res_scale;
+#if defined(__linux__) && defined(GOW_HAVE_XBRZ)
+    g_smooth_at_init = o->hud_smooth;
+#endif
     g_fx_scale = o->fx_scale < 1 ? g_scale : o->fx_scale > 8 ? 8 : o->fx_scale;
     g_samples = 1;
     for (int n = 8; n > 1; n /= 2) {
@@ -1148,6 +1158,7 @@ void rt_gpu_texture_upload(uint64_t key, int w, int h, int levels, const uint32_
             e->lod_shift = 0;  /* mip levels the pack's picture has above the PSP's level 0 */
             while ((w << (e->lod_shift + 1)) <= p->w) e->lod_shift++;
             e->replaced = 1;
+            e->smooth = 0;
             e->used = g_frame;
             g_tex_count++;
             g_st.replaced++;
@@ -1161,6 +1172,7 @@ void rt_gpu_texture_upload(uint64_t key, int w, int h, int levels, const uint32_
     e->h = h;
     e->levels = nl;
     e->replaced = 0;
+    e->smooth = 0;
     e->used = g_frame;
     g_tex_count++;
     for (int l = 0; l < nl; l++) {
@@ -1182,8 +1194,65 @@ void rt_gpu_texture_upload(uint64_t key, int w, int h, int levels, const uint32_
     g_st.uploads++;
 }
 
+#if defined(__linux__) && defined(GOW_HAVE_XBRZ)
+/* --smooth-hud: the HUD, text and icons are drawn texel for texel with point sampling, which shows their pixels at
+ * a higher internal resolution. Their textures go through xBRZ instead, by the internal resolution (2 to 4), and
+ * are drawn with linear filtering. Pictures the size of the screen (loading screens) and movies stay as they are;
+ * a change of the option or of the resolution starts the textures afresh (g_tex_flush). */
+void rt_xbrz_scale(int factor, const uint32_t *src, uint32_t *dst, int w, int h);
+extern int rt_movie_on;  /* rt_mpeg.c */
+static uint64_t g_smooth_us;
+
+void rt_gpu_texture_upload_hud(uint64_t key, int w, int h, int levels, const uint32_t *rgba) {
+    int f = g_scale < 4 ? g_scale : 4;
+    while (f > 1 && (w * f > 2048 || h * f > 2048)) f--;
+    if (!rt_gpu_opt.hud_smooth || f < 2 || (w >= 480 && h >= 256) || rt_movie_on || g_pack) {
+        rt_gpu_texture_upload(key, w, h, levels, rgba);
+        return;
+    }
+    key |= 1;
+    TexEntry *e = tex_slot(key);
+    if (e->key || g_tex_count > TEX_SLOTS * 3 / 4) return;
+    int sw = w * f, sh = h * f;
+    size_t bytes = (size_t)sw * sh * 4, off = (g_upsize + 511) & ~(size_t)511;
+    e->tex = make_texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, SDL_GPU_TEXTUREUSAGE_SAMPLER, sw, sh, 1, SDL_GPU_SAMPLECOUNT_1);
+    if (!e->tex) return;
+    grow((void **)&g_upbytes, &g_upbcap, off + bytes, 1);
+    uint64_t t0 = SDL_GetTicksNS();
+    rt_xbrz_scale(f, rgba, (uint32_t *)(g_upbytes + off), w, h);
+    g_smooth_us += (SDL_GetTicksNS() - t0) / 1000;
+    g_upsize = off + bytes;
+    e->key = key;
+    e->w = w;
+    e->h = h;
+    e->levels = 1;
+    e->replaced = 0;
+    e->smooth = 1;
+    e->used = g_frame;
+    g_tex_count++;
+    grow((void **)&g_ups, &g_upcap, g_nups + 1, sizeof(Upload));
+    memset(&g_ups[g_nups], 0, sizeof(Upload));
+    g_ups[g_nups].tex = e->tex; g_ups[g_nups].offset = (uint32_t)off; g_ups[g_nups].w = sw; g_ups[g_nups].h = sh;
+    g_nups++;
+    g_st.uploads++;
+    g_st.smoothed++;
+    g_st.upload_bytes += bytes;
+}
+#else
+void rt_gpu_texture_upload_hud(uint64_t key, int w, int h, int levels, const uint32_t *rgba) { rt_gpu_texture_upload(key, w, h, levels, rgba); }
+#endif
+
 /* releases textures not used for a while (after the frame was submitted) */
 static void evict_textures(void) {
+#if defined(__linux__) && defined(GOW_HAVE_XBRZ)
+    if (g_tex_flush) {
+        for (size_t i = 0; i < TEX_SLOTS; i++) if (g_tex[i].key && !g_tex[i].replaced) SDL_ReleaseGPUTexture(g_dev, g_tex[i].tex);
+        memset(g_tex, 0, TEX_SLOTS * sizeof(TexEntry));
+        g_tex_count = 0;
+        g_tex_flush = 0;
+        return;
+    }
+#endif
     if (g_tex_count < TEX_SLOTS / 2 && g_frame % 600) return;
     TexEntry *old = g_tex;
     g_tex = calloc(TEX_SLOTS, sizeof(TexEntry));
@@ -1253,6 +1322,14 @@ void rt_gpu_draw(const GpuDraw *d, const GpuVertex *v, uint32_t n) {
                     if (dr.lodmode == 2) dr.lodoff += 16 * e->lod_shift;  /* a constant level counts from the PSP's level 0 */
                     dr.pixel_mapped = 0;
                     d = &dr;
+                } else if (e->smooth) {  /* --smooth-hud: xBRZ's picture, filtered */
+                    static GpuDraw ds;
+                    ds = *d;
+                    ds.levels = 1;
+                    ds.minf = ds.magf = 1;
+                    ds.mipf = 0;
+                    ds.pixel_mapped = 0;
+                    d = &ds;
                 }
             }
         }
@@ -1995,6 +2072,42 @@ static void input_overlay(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *sc, Uint32 
     post_pass(cmd, sc, g_swfmt, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_LOADOP_LOAD, &vp, NULL, g_in_tex, IN_W, IN_H, &u, 0);
 }
 
+/* The in-game options menu (rt_host.c draws it on the CPU): uploaded and drawn over the picture while it is open */
+static SDL_GPUTexture *g_menu_tex;
+static const void *g_menu_px;
+static int g_menu_w, g_menu_h;
+
+static void menu_overlay(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *sc, Uint32 sw, Uint32 sh) {
+    if (!g_menu_px) return;
+    if (!g_menu_tex) g_menu_tex = make_texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, SDL_GPU_TEXTUREUSAGE_SAMPLER, g_menu_w, g_menu_h, 1, SDL_GPU_SAMPLECOUNT_1);
+    SDL_GPUTransferBufferCreateInfo ti = { SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, (Uint32)g_menu_w * (Uint32)g_menu_h * 4, 0 };
+    SDL_GPUTransferBuffer *tb = g_menu_tex ? SDL_CreateGPUTransferBuffer(g_dev, &ti) : NULL;
+    if (!tb) return;
+    void *px = SDL_MapGPUTransferBuffer(g_dev, tb, false);
+    if (!px) { SDL_ReleaseGPUTransferBuffer(g_dev, tb); return; }
+    memcpy(px, g_menu_px, (size_t)g_menu_w * g_menu_h * 4);
+    SDL_UnmapGPUTransferBuffer(g_dev, tb);
+    SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureTransferInfo src = { tb, 0, (Uint32)g_menu_w, (Uint32)g_menu_h };
+    SDL_GPUTextureRegion r;
+    memset(&r, 0, sizeof(r));
+    r.texture = g_menu_tex; r.w = (Uint32)g_menu_w; r.h = (Uint32)g_menu_h; r.d = 1;
+    SDL_UploadToGPUTexture(cp, &src, &r, false);
+    SDL_EndGPUCopyPass(cp);
+    SDL_ReleaseGPUTransferBuffer(g_dev, tb);
+    PostU u;
+    memset(&u, 0, sizeof(u));
+    u.src[2] = (float)g_menu_w; u.src[3] = (float)g_menu_h;
+    u.mode[0] = P_PRESENT;
+    u.mode[1] = 1;
+    u.mode[2] = (uint32_t)g_hdr_out;
+    u.p0[0] = g_paper; u.p0[1] = g_peak; u.p0[2] = 0.55f;
+    int f = imax(1, imin((int)sw / g_menu_w, (int)sh / g_menu_h));
+    SDL_GPUViewport vp = { floorf(((float)sw - (float)(g_menu_w * f)) / 2), floorf(((float)sh - (float)(g_menu_h * f)) / 2),
+                           (float)(g_menu_w * f), (float)(g_menu_h * f), 0.0f, 1.0f };
+    post_pass(cmd, sc, g_swfmt, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_LOADOP_LOAD, &vp, NULL, g_menu_tex, g_menu_w, g_menu_h, &u, 0);
+}
+
 /* The displayed framebuffer into the window: FXAA and sharpening at the internal resolution
  * (when on), then scaled into the window, letterboxed, as SDR or HDR. */
 static void draw_to_window(SDL_GPUCommandBuffer *cmd, int t, int x, int y) {
@@ -2015,6 +2128,7 @@ static void draw_to_window(SDL_GPUCommandBuffer *cmd, int t, int x, int y) {
         ci.store_op = SDL_GPU_STOREOP_STORE;
         ci.clear_color.a = 1.0f;
         SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &ci, 1, NULL));
+        menu_overlay(cmd, sc, sw, sh);
         return;
     }
     int tw, th;
@@ -2039,6 +2153,52 @@ static void draw_to_window(SDL_GPUCommandBuffer *cmd, int t, int x, int y) {
     post_pass(cmd, sc, g_swfmt, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_LOADOP_CLEAR, &vp, NULL, src, tw, th, &u, !rt_gpu_opt.nearest);
     if (rt_gpu_opt.show_fps) fps_overlay(cmd, sc);
     if (rt_gpu_opt.show_input) input_overlay(cmd, sc, sh);
+    menu_overlay(cmd, sc, sw, sh);
+}
+
+/* What the window showed last, for the options menu, which opens at any point of a frame */
+static int g_last_t = -1, g_last_x, g_last_y;
+
+void rt_gpu_menu_show(const void *rgba, int w, int h) {
+    if (!g_dev || !g_win) return;
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(g_dev);
+    if (!cmd) return;
+    g_menu_px = rgba; g_menu_w = w; g_menu_h = h;
+    draw_to_window(cmd, g_last_t, g_last_x, g_last_y);
+    g_menu_px = NULL;
+    submit(cmd);
+}
+
+/* The options menu closed: takes the new settings in between frames, when no recorded draw holds a sampler. MSAA
+ * stays as it started: every pipeline and target is made for that sample count. */
+static int g_options_changed;
+void rt_gpu_options_changed(void) { g_options_changed = 1; }
+
+static void apply_options(void) {
+    static int vsync_now = -1;
+    const GpuOptions *o = &rt_gpu_opt;
+    g_options_changed = 0;
+    int old_scale = g_scale;
+    g_scale = o->res_scale < 1 ? 1 : o->res_scale > 8 ? 8 : o->res_scale;
+#if defined(__linux__) && defined(GOW_HAVE_XBRZ)
+    static int smooth_was = -1;
+    if (smooth_was < 0) smooth_was = g_smooth_at_init;
+    if (o->hud_smooth != smooth_was || (o->hud_smooth && g_scale != old_scale)) g_tex_flush = 1;
+    smooth_was = o->hud_smooth;
+#else
+    (void)old_scale;
+#endif
+    g_fx_scale = o->fx_scale < 1 ? g_scale : o->fx_scale > 8 ? 8 : o->fx_scale;
+    for (int i = 0; i < g_ntargets; i++) {
+        int s = target_scale(g_targets[i].addr);
+        if (s != g_targets[i].s) g_targets[i].want_s = s;
+    }
+    for (int i = 0; i < g_nsamps; i++) SDL_ReleaseGPUSampler(g_dev, g_samps[i].s);  /* made for the old --aniso */
+    g_nsamps = 0;
+    if (vsync_now < 0) vsync_now = g_swap_vsync;
+    if (g_win && o->vsync != vsync_now) { vsync_now = o->vsync; setup_swapchain(); }
+    printf("[gpu] options applied: internal resolution %dx, anisotropic %dx, FXAA %s, sharpening %.2f, V-Sync %s\n", g_scale,
+           o->aniso > 1 ? o->aniso : 1, o->fxaa ? "on" : "off", o->sharpen, o->vsync ? "on" : "off");
 }
 
 /* RT_GPU_DUMP=N: after frame N, writes every target's drawn area (gpu) and the same area of PSP
@@ -2100,6 +2260,7 @@ void rt_gpu_present(uint32_t addr, uint32_t stride, uint32_t fmt) {
         }
         if (t >= 0 && g_targets[t].s != g_scale) g_targets[t].want_s = g_scale;  /* shown: the full scale, from the next frame */
     }
+    g_last_t = t; g_last_x = x; g_last_y = y;
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(g_dev);
     if (!cmd) return;
     upload_frame(cmd);
@@ -2125,6 +2286,7 @@ void rt_gpu_present(uint32_t addr, uint32_t stride, uint32_t fmt) {
     for (int i = 0; i < g_nsnaps; i++) g_snaps[i].busy = 0;
     g_frame++;
     g_st.frames++;
+    if (g_options_changed) apply_options();
     for (int i = 0; i < g_ntargets; i++) if (g_targets[i].want_s) rescale_target(i);
     evict_textures();
     evict_pool();
@@ -2170,6 +2332,9 @@ void rt_gpu_report(void) {
            (unsigned long long)g_st.frames, (unsigned long long)g_st.draws, (unsigned long long)g_st.merged, (unsigned long long)g_st.verts,
            (unsigned long long)g_st.passes, (unsigned long long)g_st.uploads, g_st.upload_bytes / 1048576.0,
            (unsigned long long)g_st.pipelines);
+#if defined(__linux__) && defined(GOW_HAVE_XBRZ)
+    if (g_st.smoothed) printf("[gpu] smooth HUD: %llu textures scaled by xBRZ in %.1f ms\n", (unsigned long long)g_st.smoothed, g_smooth_us / 1000.0);
+#endif
     printf("[gpu] %llu render targets, %llu render-to-texture snapshots, %llu uploads into targets, %llu GPU copies, "
            "%llu readbacks, %llu mid-frame submits, %llu stencil-to-alpha copies, %llu fills across formats\n",
            (unsigned long long)g_st.targets, (unsigned long long)g_st.snapshots, (unsigned long long)g_st.target_uploads,
@@ -2247,11 +2412,14 @@ int rt_gpu_init(void *window, const char *driver) { (void)window; (void)driver; 
 int rt_gpu_active(void) { return 0; }
 int rt_gpu_scale(void) { return 1; }
 int rt_gpu_capture_full(void) { return 0; }
+void rt_gpu_menu_show(const void *rgba, int w, int h) { (void)rgba; (void)w; (void)h; }
+void rt_gpu_options_changed(void) {}
 float rt_gpu_aspect_squeeze(void) { return 1.0f; }
 int rt_gpu_shown_fb(uint32_t addr) { (void)addr; return 0; }
 void rt_gpu_shutdown(void) {}
 int rt_gpu_texture_resident(uint64_t key) { (void)key; return 1; }
 void rt_gpu_texture_upload(uint64_t key, int w, int h, int levels, const uint32_t *rgba) { (void)key; (void)w; (void)h; (void)levels; (void)rgba; }
+void rt_gpu_texture_upload_hud(uint64_t key, int w, int h, int levels, const uint32_t *rgba) { (void)key; (void)w; (void)h; (void)levels; (void)rgba; }
 int rt_gpu_texture_is_target(uint32_t addr, uint32_t pitch, int bpp) { (void)addr; (void)pitch; (void)bpp; return 0; }
 void rt_gpu_draw(const GpuDraw *d, const GpuVertex *v, uint32_t n) { (void)d; (void)v; (void)n; }
 void rt_gpu_transfer_begin(uint32_t src, uint32_t spitch, int sx, int sy, uint32_t dst, uint32_t dpitch, int dx, int dy,

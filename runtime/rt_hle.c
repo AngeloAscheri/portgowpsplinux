@@ -94,6 +94,33 @@ void rt_display_set_hz(double hz) {
 }
 double rt_display_hz(void) { return g_vblank_us == 16683u ? 59.94 : 1e6 / g_vblank_us; }
 #define VBLANK_US g_vblank_us
+#ifdef __linux__
+/* While a movie plays the guest's vblank stays at the PSP's 59.94 Hz, whatever --fps says: both games' players pace
+ * their pictures by vblanks (a flip, then sceDisplayWaitVblankStart) and wait for the sound on sceDisplayGetVcount,
+ * so at 144 Hz they ran 2.4 times ahead and stopped ~300 ms every half second for the audio. sceDisplayGetFramePerSec,
+ * asked once when the player is set up (before the stream starts), has to agree. The count goes on from
+ * where it was when the period changes (also for an --fps change from the options menu). */
+static uint32_t guest_vblank_us(void) { return rt_movie_on ? 16683u : g_vblank_us; }
+static uint64_t g_vc_base, g_vc_t;  /* the count at g_vc_t, the last change of period */
+static uint32_t g_vc_us;
+static uint64_t vblank_count(void) {
+    uint32_t us = guest_vblank_us();
+    if (!g_vc_us) g_vc_us = us;
+    if (us != g_vc_us) {
+        g_vc_base += (k_now - g_vc_t) / g_vc_us;
+        g_vc_t = k_now;
+        g_vc_us = us;
+    }
+    return g_vc_base + (k_now - g_vc_t) / g_vc_us;
+}
+static uint64_t next_vblank(void) {
+    vblank_count();
+    return g_vc_t + ((k_now - g_vc_t) / g_vc_us + 1) * g_vc_us;
+}
+#define FLIP_US guest_vblank_us()
+#else
+#define FLIP_US VBLANK_US
+#endif
 static uint64_t g_frames;
 static uint32_t g_fb_addr, g_fb_width, g_fb_format;
 
@@ -118,18 +145,30 @@ static void hle_DisplaySetFrameBuf(RtCtx *c) {
     if (rt_max_frames && g_frames >= rt_max_frames) k_stop(RT_ABORT_BUDGET, 0, (uint32_t)g_frames, "frame limit reached");
     if (A0 && prev && A0 != prev) {
         uint64_t now = k_now, wait = g_next_flip > now ? g_next_flip - now : 0;
-        g_next_flip = (g_next_flip > now ? g_next_flip : now) + VBLANK_US - 10;
+        g_next_flip = (g_next_flip > now ? g_next_flip : now) + FLIP_US - 10;
         if (wait > 1000) k_wait(WT_VBLANK, 0, wait);
     }
     RET(0);
 }
 static void hle_DisplayWaitVblankStart(RtCtx *c) {
+#ifdef __linux__
+    uint64_t next = next_vblank();
+#else
     uint64_t next = (k_now / VBLANK_US + 1) * VBLANK_US;
+#endif
     k_wait(WT_VBLANK, 0, next - k_now);
     RET(0);
 }
+#ifdef __linux__
+static void hle_DisplayGetVcount(RtCtx *c) { RET((uint32_t)vblank_count()); }
+#else
 static void hle_DisplayGetVcount(RtCtx *c) { RET((uint32_t)(k_now / VBLANK_US)); }
+#endif
+#ifdef __linux__
+static void hle_DisplayGetFramePerSec(RtCtx *c) { c->fpr[0].f = rt_mpeg_open || VBLANK_US == 16683u ? 59.9400599f : 1e6f / (float)VBLANK_US; RET(0); }
+#else
 static void hle_DisplayGetFramePerSec(RtCtx *c) { c->fpr[0].f = VBLANK_US == 16683u ? 59.9400599f : 1e6f / (float)VBLANK_US; RET(0); }
+#endif
 
 /* --- GE (graphics engine): lists are accepted and counted, nothing is drawn yet -- */
 static uint32_t g_ge_lists;

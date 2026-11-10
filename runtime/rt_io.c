@@ -21,6 +21,9 @@
 #else
 #include <sys/stat.h>
 #include <time.h>
+#ifdef __linux__
+#include <dirent.h>
+#endif
 #define mkdir_host(p) mkdir(p, 0755)
 #define fseek64 fseeko
 #define ftell64 ftello
@@ -256,6 +259,20 @@ int rt_io_extract(const char *disc_path, const char *out) {
     return ok;
 }
 
+#ifdef __linux__
+/* A whole file of the disc in memory (malloc'd, *size bytes), or NULL: RetroAchievements' hash (rt_ra.c) */
+uint8_t *rt_io_read_disc_file(const char *disc_path, uint32_t *size) {
+    char rel[512];
+    IsoEntry e;
+    memset(&e, 0, sizeof(e));
+    if (resolve(disc_path, rel, sizeof(rel)) != DEV_DISC || !iso_lookup(rel, &e) || e.is_dir) return NULL;
+    uint8_t *buf = (uint8_t *)malloc(e.size ? e.size : 1);
+    if (buf && disc_read((uint64_t)e.lba * SECTOR, buf, e.size) == e.size) { *size = e.size; return buf; }
+    free(buf);
+    return NULL;
+}
+#endif
+
 /* --- file descriptors ----------------------------------------------------------- */
 typedef struct {
     int used, is_dir, close_pending;
@@ -285,7 +302,37 @@ static void fd_free(int fd) {
     memset(f, 0, sizeof(*f));
 }
 
+#ifdef __linux__
+/* A Memory Stick and Windows ignore case and Linux does not: each part of the path that is not there as
+ * asked takes the name of an entry that matches in any case (a DLC copied as DLCARENA.EDAT, asked for as
+ * dlcarena.EDAT). A part with no match stays as asked, for files the game creates. */
+static void host_path(const char *rel, char *out, size_t n) {
+    snprintf(out, n, "%s", g_ms0);
+    size_t len = strlen(out);
+    for (const char *p = rel; *p && len + 1 < n;) {
+        while (*p == '/') p++;
+        size_t k = strcspn(p, "/");
+        if (!k) break;
+        char part[256];
+        snprintf(part, sizeof(part), "%.*s", (int)k, p);
+        p += k;
+        struct stat st;
+        snprintf(out + len, n - len, "/%s", part);
+        if (stat(out, &st) != 0) {
+            out[len] = 0;
+            DIR *d = opendir(out);
+            struct dirent *e;
+            while (d && (e = readdir(d)))
+                if (!strcasecmp(e->d_name, part)) { snprintf(part, sizeof(part), "%s", e->d_name); break; }
+            if (d) closedir(d);
+            snprintf(out + len, n - len, "/%s", part);
+        }
+        len = strlen(out);
+    }
+}
+#else
 static void host_path(const char *rel, char *out, size_t n) { snprintf(out, n, "%s/%s", g_ms0, rel); }
+#endif
 
 /* Returns fd (>= 3) or a negative PSP error */
 static int32_t io_open(const char *path, uint32_t flags) {

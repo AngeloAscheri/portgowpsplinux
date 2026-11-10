@@ -3,7 +3,13 @@
   "UCUS98653": {
     "0x08A157B8": "rt_co_switch(c, 0x08B36148u, 0x08B36150u)"
   },
+  "UCES00842": {
+    "0x08A157B8": "rt_co_switch(c, 0x08B36158u, 0x08B36160u)"
+  },
   "UCUS98737": {
     "0x08AD775C": "rt_co_switch(c, 0x08C15D88u, 0x08C15D90u)"
+  },
+  "UCES01401": {
+    "0x08AD86F8": "rt_co_switch(c, 0x08C17350u, 0x08C17358u)"
   }
 }

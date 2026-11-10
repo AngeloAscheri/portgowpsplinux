@@ -1,0 +1,22 @@
+Poné acá la copia de seguridad de tu propio disco (UMD), una carpeta por juego:
+
+  chains-of-olympus/   God of War: Chains of Olympus
+  ghost-of-sparta/     God of War: Ghost of Sparta
+
+Sirve un .iso o un .chd. El nombre del archivo no importa: el programa reconoce el disco por su
+código (lo lee con gow_disc --id) y avisa si es otro juego o si está en la carpeta equivocada.
+
+Discos que sirven:
+
+  Chains of Olympus   UCUS98653 (EE. UU., solo inglés)
+                      UCES00842 (Europa, con español)
+  Ghost of Sparta     UCUS98737 (EE. UU., inglés, francés y español)
+                      UCES01401 (Europa, con español)
+
+Si ponés los dos discos de un mismo juego, el selector deja elegir cuál jugar.
+
+Cómo sacar la copia: con una PSP con firmware personalizado, desde su menú VSH ("USB Device: UMD Disc")
+la PSP muestra el UMD como un .iso por USB; copialo tal cual. Para que ocupe menos, un .chd hecho con
+"chdman createdvd" también sirve.
+
+El proyecto no trae ni descarga ningún juego. Git no sube nada de esta carpeta salvo estos textos.

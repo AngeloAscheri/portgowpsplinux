@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=God of War PSP
+Comment=Native port of God of War: Chains of Olympus and Ghost of Sparta, built from your own discs
+Exec=AppRun
+Icon=gow-psp
+Categories=Game;
+Terminal=true

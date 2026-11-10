@@ -9,6 +9,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import time
 import zlib
 from pathlib import Path
@@ -65,6 +66,12 @@ def steam_dir():
     env = os.environ.get("GOW_STEAM_DIR")
     if env:
         return Path(env)
+    if sys.platform.startswith("linux"):  # native, then Flatpak
+        home = Path.home()
+        for p in (home / ".local/share/Steam", home / ".steam/steam", home / ".var/app/com.valvesoftware.Steam/.local/share/Steam"):
+            if (p / "userdata").is_dir() or (p / "config").is_dir():
+                return p.resolve()
+        return None
     if os.name != "nt":
         return None
     import winreg
@@ -106,6 +113,14 @@ def account_id(steam):
 def steam_running():
     if os.environ.get("GOW_STEAM_DIR"):
         return os.environ.get("GOW_STEAM_RUNNING") == "1"
+    if sys.platform.startswith("linux"):  # a process named steam (Steam's client; steam.sh starts it)
+        for d in Path("/proc").iterdir():
+            try:
+                if d.name.isdigit() and (d / "comm").read_text().strip() == "steam":
+                    return True
+            except OSError:
+                pass
+        return False
     if os.name != "nt":
         return False
     try:

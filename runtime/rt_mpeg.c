@@ -111,6 +111,11 @@ static uint64_t g_total_video, g_total_audio, g_total_errors, g_movies;
 
 static void delay_us(uint64_t us) { k_wait(WT_DELAY, 0, us); }
 
+/* For sceDisplay (rt_hle.c), which keeps the PSP's vblank for the player: rt_mpeg_open from sceMpegCreate to
+ * sceMpegDelete (Ghost of Sparta also creates one in its levels that it doesn't play), rt_movie_on from the stream's
+ * start (sceMpegQueryStreamOffset) to its end, skip or sceMpegDelete */
+int rt_mpeg_open, rt_movie_on;
+
 static void write_au(uint32_t addr, int64_t pts, int64_t dts, uint32_t es_buffer, uint32_t es_size) {
     rt_w32(addr, (uint32_t)((uint64_t)pts >> 32)); rt_w32(addr + 4, (uint32_t)pts);
     rt_w32(addr + 8, (uint32_t)((uint64_t)dts >> 32)); rt_w32(addr + 12, (uint32_t)dts);
@@ -413,6 +418,7 @@ static Stream *find_stream(Mpeg *m, uint32_t sid) {
 
 static void log_end(Mpeg *m) {
     rt_host_movie_playing(0);
+    rt_movie_on = 0;
     if (m->logged_end++) return;
     rt_log("[mpeg] movie ended: %u pictures, %u audio frames decoded%s\n", m->video_frames, m->audio_frames,
            m->errors ? " (with decode errors)" : "");
@@ -470,6 +476,7 @@ static void hle_MpegCreate(RtCtx *c) {
     m->next_packet = ring_packet;
     m->vscan = 4;
     g_movies++;
+    rt_mpeg_open = 1;
     delay_us(29000);
     RET(0);
 }
@@ -479,6 +486,7 @@ static void hle_MpegDelete(RtCtx *c) {
     if (!m) RET(-1);
     if (m->video_frames || m->audio_frames) log_end(m);
     mpeg_free(m);
+    rt_mpeg_open = rt_movie_on = 0;
     delay_us(40000);
     RET(0);
 }
@@ -558,6 +566,7 @@ static void hle_MpegQueryStreamOffset(RtCtx *c) {
     demux_reset(m);
     analyze_header(m, h);
     rt_w32(A2, off);
+    rt_movie_on = 1;
     rt_log("[mpeg] movie: %dx%d, %u bytes of stream, %.2f s (timestamps %lld..%lld)\n", m->width, m->height, m->stream_size,
            (double)(m->last_ts - m->first_ts) / 90000.0, (long long)m->first_ts, (long long)m->last_ts);
     RET(0);
@@ -622,6 +631,7 @@ static void check_skip(Mpeg *m) {
     m->skipped = 1;
     m->have_vau = m->have_aau = 0;
     rt_host_movie_playing(0);
+    rt_movie_on = 0;
     rt_log("[mpeg] movie skipped after %u pictures\n", m->video_frames);
     if (m->next_packet == ring_packet) while (ring_packet(m)) {}
 }

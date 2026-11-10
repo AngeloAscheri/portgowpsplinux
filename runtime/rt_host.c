@@ -35,6 +35,7 @@
 #include "rt_gpu.h"
 #include "rt_host.h"
 #include "rt_kernel.h"
+#include "rt_settings.h"
 
 #define DISP_W 480
 #define DISP_H 272
@@ -590,9 +591,261 @@ static int confirm_quit(void) {
     return answer;
 }
 
+/* V-Sync shows at most one frame per refresh: a --fps above the display's refresh only made the virtual time
+ * fall behind and skip, and on a PC a little slower than a refresh V-Sync then waited for two (issue #35:
+ * 30 FPS). The rate of a recording being replayed is kept. */
+static void limit_refresh(void) {
+    const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_win));
+    if (g_o.gpu && rt_gpu_opt.vsync && rt_gpu_opt.fps > 0 && !g_o.input && dm && dm->refresh_rate > 0 &&
+        rt_display_hz() > dm->refresh_rate + 1.0) {
+        printf("[host] V-Sync on a %.0f Hz display: the game runs at %.0f FPS instead of %.0f\n", dm->refresh_rate,
+               dm->refresh_rate, rt_display_hz());
+        rt_display_set_hz(dm->refresh_rate);
+    }
+}
+
+/* --- in-game options menu --------------------------------------------------------
+ * Back + left stick click, or F10, with the hardware renderer. The same choices as the launcher's options, for a
+ * player with only a gamepad. The game waits while it is open, like the quit question. --settings FILE keeps them. */
+#define MENU_W 480
+#define MENU_H 300
+
+static Settings g_set;
+
+static const float ASPECT_F[] = { 0.0f, 21.0f / 9.0f, 32.0f / 9.0f, 4.0f / 3.0f };
+
+typedef struct { const char *label, *key; int *v; const int *vals; int n; const char *const *names; } MenuRow;
+#define ROW(label, key, field, vals, names) { label, key, &g_set.field, vals, (int)(sizeof(vals) / sizeof(vals[0])), names },
+static const MenuRow MENU_ROWS[] = { RT_SETTINGS_ROWS(ROW) };
+enum { MENU_NROWS = (int)(sizeof(MENU_ROWS) / sizeof(MENU_ROWS[0])), MENU_BACK = MENU_NROWS, MENU_QUIT, MENU_NITEMS };
+
+static void settings_from_options(void) {
+    const GpuOptions *o = &rt_gpu_opt;
+    g_set.res = o->res_scale < 1 ? 1 : o->res_scale;
+    g_set.fps = o->fps > 0 ? (int)(o->fps + 0.5f) : 60;
+    g_set.vsync = o->vsync != 0;
+    g_set.msaa = o->msaa < 1 ? 1 : o->msaa;
+    g_set.fxaa = o->fxaa != 0;
+    g_set.aniso = o->aniso < 1 ? 1 : o->aniso;
+    g_set.sharpen = (int)(o->sharpen * 100.0f + 0.5f);
+    g_set.aspect = 0;
+    for (int i = 1; i < 4; i++) if (fabsf(o->aspect - ASPECT_F[i]) < 0.01f) g_set.aspect = i;
+    g_set.crt = o->crt != 0;
+    g_set.hud_smooth = o->hud_smooth != 0;
+    g_set.fullscreen = g_fullscreen || g_o.fullscreen;
+}
+
+static void settings_to_options(void) {
+    GpuOptions *o = &rt_gpu_opt;
+    o->res_scale = g_set.res;
+    o->fps = (float)g_set.fps;
+    o->vsync = g_set.vsync;
+    o->msaa = g_set.msaa;
+    o->fxaa = g_set.fxaa;
+    o->aniso = g_set.aniso;
+    o->sharpen = (float)g_set.sharpen / 100.0f;
+    o->aspect = ASPECT_F[g_set.aspect];
+    o->crt = g_set.crt;
+    o->hud_smooth = g_set.hud_smooth;
+}
+
+/* Before the window opens. A line that isn't a known key with one of its menu values is left out. */
+static void settings_load(void) {
+    FILE *f = rt_gpu_opt.settings ? fopen(rt_gpu_opt.settings, "r") : NULL;
+    if (!f) return;
+    settings_from_options();
+    char line[128], key[64];
+    int value;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%63[^=]=%d", key, &value) != 2) continue;
+        for (int i = 0; i < MENU_NROWS; i++) {
+            if (strcmp(key, MENU_ROWS[i].key)) continue;
+            for (int k = 0; k < MENU_ROWS[i].n; k++) if (MENU_ROWS[i].vals[k] == value) *MENU_ROWS[i].v = value;
+        }
+    }
+    fclose(f);
+    settings_to_options();
+    g_o.fullscreen = g_set.fullscreen;
+    printf("[host] settings read from %s\n", rt_gpu_opt.settings);
+}
+
+static void settings_save(void) {
+    FILE *f = rt_gpu_opt.settings ? fopen(rt_gpu_opt.settings, "w") : NULL;
+    if (!f) return;
+    for (int i = 0; i < MENU_NROWS; i++) fprintf(f, "%s=%d\n", MENU_ROWS[i].key, *MENU_ROWS[i].v);
+    fclose(f);
+}
+
+/* The menu's choices take effect: the renderer's after the next frame, and the frame rate and window here. */
+static void settings_commit(const Settings *before) {
+    settings_to_options();
+    if (g_set.fullscreen != g_fullscreen) {
+        g_fullscreen = g_set.fullscreen;
+        SDL_SetWindowFullscreen(g_win, g_fullscreen);
+    }
+    if (g_set.fps != before->fps || g_set.vsync != before->vsync) {
+        setup_refresh();
+        limit_refresh();
+    }
+    rt_gpu_options_changed();
+    settings_save();
+}
+
+static void menu_change(int row, int dir) {
+    const MenuRow *m = &MENU_ROWS[row];
+    int at = 0;
+    for (int k = 0; k < m->n; k++) if (m->vals[k] == *m->v) at = k;
+    *m->v = m->vals[(at + dir + m->n) % m->n];
+    settings_to_options();  /* what the picture reads at once (CRT, sharpening...) shows behind the menu */
+}
+
+static void menu_text(SDL_Renderer *r, float x, float y, const char *s) { SDL_RenderDebugText(r, x, y, s); }
+
+static void menu_draw(SDL_Renderer *r, int sel) {
+    SDL_SetRenderDrawColor(r, 14, 12, 10, 235);
+    SDL_RenderClear(r);
+    SDL_SetRenderDrawColor(r, 233, 214, 164, 255);
+    menu_text(r, (MENU_W - 8 * 8) / 2.0f, 12, "OPCIONES");
+    for (int i = 0; i < MENU_NITEMS; i++) {
+        float y = 32.0f + (float)i * 16.0f + (i >= MENU_NROWS ? 6.0f : 0.0f);
+        if (i == sel) {
+            SDL_FRect bar = { 12, y - 4, MENU_W - 24, 16 };
+            SDL_SetRenderDrawColor(r, 90, 70, 36, 255);
+            SDL_RenderFillRect(r, &bar);
+        }
+        Uint8 c = i == sel ? 255 : 190;
+        SDL_SetRenderDrawColor(r, c, c, c, 255);
+        if (i == MENU_BACK) { menu_text(r, 24, y, "Volver al juego"); continue; }
+        if (i == MENU_QUIT) { menu_text(r, 24, y, "Salir del juego"); continue; }
+        const MenuRow *m = &MENU_ROWS[i];
+        char v[32];
+        const char *name = m->names[0];
+        for (int k = 0; k < m->n; k++) if (m->vals[k] == *m->v) name = m->names[k];
+        snprintf(v, sizeof(v), i == sel ? "< %s >" : "  %s", name);
+        menu_text(r, 24, y, m->label);
+        menu_text(r, 280, y, v);
+    }
+    SDL_SetRenderDrawColor(r, 170, 160, 140, 255);
+    menu_text(r, 24, MENU_H - 28, "Cruceta o stick: elegir y cambiar");
+    menu_text(r, 24, MENU_H - 16, "A: aceptar   B: volver al juego");
+    SDL_FlushRenderer(r);
+}
+
+/* test_ms: closes by itself after that time (RT_TEST_OPTIONS) */
+#ifdef __linux__
+/* With Steam Input on a desktop, SDL sees the gamepad twice (Steam's virtual one and the real one) and a press
+ * arrives from both: the same move from another gamepad within 120 ms is the same press (gow_menu.c does the same) */
+static int twin_press(int code, SDL_JoystickID dev) {
+    static int last_code = -1;
+    static SDL_JoystickID last_dev;
+    static Uint64 last_ms;
+    Uint64 now = SDL_GetTicks();
+    int same = code == last_code && dev != last_dev && now - last_ms < 120;
+    if (!same) { last_code = code; last_dev = dev; last_ms = now; }
+    return same;
+}
+#endif
+
+static void options_menu(int test_ms) {
+    printf("[host] options menu opened\n");
+    rt_audio_pause(1);
+    SDL_Surface *s = SDL_CreateSurface(MENU_W, MENU_H, SDL_PIXELFORMAT_RGBA32);
+    SDL_Renderer *r = s ? SDL_CreateSoftwareRenderer(s) : NULL;
+    if (!r) fprintf(stderr, "[host] options menu: %s\n", SDL_GetError());
+    settings_from_options();
+    g_set.fullscreen = g_fullscreen;
+    Settings before = g_set;
+    Uint64 end = SDL_GetTicks() + (Uint64)test_ms;
+    int sel = 0, open = r != NULL, stick_x = 0, stick_y = 0;
+    while (open && !(test_ms && SDL_GetTicks() >= end)) {
+        menu_draw(r, sel);
+        rt_gpu_menu_show(s->pixels, MENU_W, MENU_H);
+        SDL_Event e;
+        if (!SDL_WaitEventTimeout(&e, 16)) continue;
+        do {
+            int dx = 0, dy = 0, ok = 0;
+            switch (e.type) {
+            case SDL_EVENT_QUIT: g_quit = 1; open = 0; break;
+            case SDL_EVENT_KEY_DOWN:
+                if (e.key.repeat) break;
+                if (e.key.key == SDLK_F10 || e.key.key == SDLK_ESCAPE) open = 0;
+                else if (e.key.key == SDLK_RETURN) ok = 1;
+                else if (e.key.key == SDLK_UP) dy = -1;
+                else if (e.key.key == SDLK_DOWN) dy = 1;
+                else if (e.key.key == SDLK_LEFT) dx = -1;
+                else if (e.key.key == SDLK_RIGHT) dx = 1;
+                break;
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST || e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) open = 0;
+                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) ok = 1;
+                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_UP) dy = -1;
+                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_DOWN) dy = 1;
+                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) dx = -1;
+                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) dx = 1;
+                break;
+            case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+                int *latch = e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ? &stick_x : e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY ? &stick_y : NULL;
+                if (!latch) break;
+                if (abs(e.gaxis.value) < 10000) *latch = 0;
+                else if (!*latch && abs(e.gaxis.value) > 20000) {
+                    *latch = 1;
+                    if (latch == &stick_x) dx = e.gaxis.value < 0 ? -1 : 1;
+                    else dy = e.gaxis.value < 0 ? -1 : 1;
+                }
+                break;
+            }
+            case SDL_EVENT_GAMEPAD_ADDED: open_pad(e.gdevice.which); break;
+            case SDL_EVENT_GAMEPAD_REMOVED: close_pad(e.gdevice.which); break;
+            default: break;
+            }
+#ifdef __linux__
+            if ((dx || dy || ok) && (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) &&
+                twin_press((dx + 1) | (dy + 1) << 2 | ok << 4, e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? e.gbutton.which : e.gaxis.which))
+                dx = dy = ok = 0;
+#endif
+            if (dy) sel = (sel + dy + MENU_NITEMS) % MENU_NITEMS;
+            if (dx && sel < MENU_NROWS) menu_change(sel, dx);
+            if (ok && sel < MENU_NROWS) menu_change(sel, 1);
+            if (ok && sel == MENU_BACK) open = 0;
+            if (ok && sel == MENU_QUIT) { g_quit = 1; open = 0; }
+        } while (open && SDL_PollEvent(&e));
+    }
+    if (r) SDL_DestroyRenderer(r);
+    if (s) SDL_DestroySurface(s);
+    settings_commit(&before);
+    g_eat = 0xFFFFFFFFu;  /* whatever is held when the menu closes waits for its release */
+    g_anchored = 0;       /* the wall clock went on without the game: start pacing afresh */
+    g_quit_hold = 0;
+    rt_audio_pause(0);
+    printf("[host] options menu closed\n");
+}
+
+/* RT_TEST_OPTIONS="FRAME:KEY=VALUE,...": for tests without a gamepad, from shown frame FRAME a setting (a key of
+ * the --settings file) changes as if chosen in the menu; KEY "menu" keeps the menu open for VALUE ms. */
+static void test_options(void) {
+    static const char *spec;
+    static int checked;
+    if (!checked) { checked = 1; spec = getenv("RT_TEST_OPTIONS"); }
+    while (spec && *spec) {
+        unsigned long long f = 0;
+        char key[32] = "";
+        int value = 0, used = 0;
+        if (sscanf(spec, "%llu:%31[^=]=%d%n", &f, key, &value, &used) != 3) { spec = NULL; return; }
+        if (g_last_frame < f) return;
+        spec += used + (spec[used] == ',');
+        if (!strcmp(key, "menu")) { options_menu(value); continue; }
+        settings_from_options();
+        g_set.fullscreen = g_fullscreen;
+        Settings before = g_set;
+        for (int i = 0; i < MENU_NROWS; i++) if (!strcmp(key, MENU_ROWS[i].key)) *MENU_ROWS[i].v = value;
+        printf("[host] test option at frame %llu: %s=%d\n", (unsigned long long)g_last_frame, key, value);
+        settings_commit(&before);
+    }
+}
+
 static void pump(void) {
     SDL_Event e;
-    int ask = 0;
+    int ask = 0, menu = 0;
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
         case SDL_EVENT_QUIT: g_quit = 1; break;  /* the close button, and Alt+F4 */
@@ -606,6 +859,7 @@ static void pump(void) {
             } else if (e.key.key == SDLK_F12) screenshot();
             else if (e.key.key == SDLK_F3) rt_gpu_opt.show_fps = !rt_gpu_opt.show_fps;  /* the frame rate in the corner */
             else if (e.key.key == SDLK_F2) rt_gpu_opt.show_input = !rt_gpu_opt.show_input;  /* the buttons pressed */
+            else if (e.key.key == SDLK_F10) menu = 1;
             else {
                 /* a movie skips on the keys bound to Start or Cross, and on Enter and Space; the press is kept
                  * from the game only for the buttons that key is bound to */
@@ -624,6 +878,10 @@ static void pump(void) {
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
             uint32_t pb = pad_bits(e.gbutton.button);
             if (pb & (PSP_START | PSP_CROSS)) movie_skip_press(pb);
+            SDL_Gamepad *gp = SDL_GetGamepadFromID(e.gbutton.which);
+            if (gp && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK) && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_LEFT_STICK) &&
+                (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK || e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK))
+                menu = 1;
             break;
         }
         case SDL_EVENT_GAMEPAD_ADDED: open_pad(e.gdevice.which); break;
@@ -639,6 +897,10 @@ static void pump(void) {
     else if (!g_quit_hold) g_quit_hold = now_us();
     else if (now_us() - g_quit_hold >= 2000000 && !g_quit) { printf("[host] Back+Start held: quitting\n"); g_quit = 1; }
     if (ask && !g_quit && confirm_quit()) g_quit = 1;
+    if (g_o.gpu && !g_o.input && rt_gpu_active()) {
+        if (menu && !g_quit) options_menu(0);
+        test_options();
+    }
     update_cursor();
     g_last_pump = now_us();
 }
@@ -656,10 +918,15 @@ static void software_instead(void) {
 int rt_host_init(const HostOptions *o) {
     g_o = *o;
     if (g_o.input && !load_script(g_o.input)) return 0;
+    if (g_o.window && g_o.gpu && !g_o.input) settings_load();
     setup_refresh();
     SDL_SetMainReady();
     if (!g_o.window) {
         if (g_o.record_input && !rec_open(g_o.record_input)) return 0;
+#ifdef __linux__
+        /* SDL turns SIGTERM and Ctrl+C into a quit event, and headless nothing reads its events: let them end the run */
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+#endif
         if (g_o.gpu && !rt_gpu_init(NULL, g_o.gpu_driver)) software_instead();
         return 1;
     }
@@ -671,16 +938,7 @@ int rt_host_init(const HostOptions *o) {
     int win_w = g_o.gpu && rt_gpu_opt.aspect > 0 ? (int)(DISP_H * scale * rt_gpu_opt.aspect + 0.5f) : DISP_W * scale;  /* --aspect */
     g_win = SDL_CreateWindow("God of War (PSP native port)", win_w, DISP_H * scale, SDL_WINDOW_RESIZABLE);
     if (!g_win) { fprintf(stderr, "[host] SDL_CreateWindow: %s\n", SDL_GetError()); return 0; }
-    /* V-Sync shows at most one frame per refresh: a --fps above the display's refresh only made the virtual time
-     * fall behind and skip, and on a PC a little slower than a refresh V-Sync then waited for two (issue #35:
-     * 30 FPS). The rate of a recording being replayed is kept. */
-    const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_win));
-    if (g_o.gpu && rt_gpu_opt.vsync && rt_gpu_opt.fps > 0 && !g_o.input && dm && dm->refresh_rate > 0 &&
-        rt_display_hz() > dm->refresh_rate + 1.0) {
-        printf("[host] V-Sync on a %.0f Hz display: the game runs at %.0f FPS instead of %.0f\n", dm->refresh_rate,
-               dm->refresh_rate, rt_display_hz());
-        rt_display_set_hz(dm->refresh_rate);
-    }
+    limit_refresh();
     if (g_o.record_input && !rec_open(g_o.record_input)) return 0;
     if (g_o.icon) {  /* otherwise Windows takes the exe's own icon (runtime/gow_rt.rc) */
         SDL_Surface *ic = SDL_LoadPNG(g_o.icon);
