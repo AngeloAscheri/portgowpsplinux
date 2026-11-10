@@ -382,7 +382,7 @@ def install(missing, out=print):
     winget = find_winget()
     if not winget:
         out("winget (Windows Package Manager) was not found. Install \"App Installer\" from the Microsoft Store, or install "
-            "these yourself: " + ", ".join(TOOLS[t]["name"] for t in missing) + " (see README.md).")
+            "these yourself: " + ", ".join(TOOLS[t]["name"] for t in missing) + " (see README-original.md).")
         return False
     for t in missing:
         cmd = winget_command(t, winget or "winget")
@@ -398,7 +398,7 @@ def install(missing, out=print):
         # 0 = installed; 0x8A15002B = already installed / no newer version
         if p.wait() not in (0, 0x8A15002B, -1978335189):
             out(f"Installing {TOOLS[t]['name']} failed (winget exit 0x{p.returncode & 0xFFFFFFFF:08X}). "
-                "Try again, or install it yourself (see README.md).")
+                "Try again, or install it yourself (see README-original.md).")
             return False
     if dry_run():
         out("dry run: nothing was installed")

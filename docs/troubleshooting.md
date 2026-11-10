@@ -1,6 +1,6 @@
 # Troubleshooting and FAQ
 
-For players of the launcher (`GoWLauncher.exe`). Developers: see the main [README](../README.md#build-from-source).
+For players of the launcher (`GoWLauncher.exe`). Developers: see the main [README](../README-original.md#build-from-source).
 
 ## Windows says "Windows protected your PC", or the antivirus flags the exe
 
@@ -90,7 +90,7 @@ What works is a pack in this port's own format:
 Texture packs need the Hardware renderer.
 ## Controls, skipping movies, quitting
 
-See [Controls](../README.md#controls) in the README. In short: Enter, Space, a click or gamepad Start/Cross skips a
+See [Controls](../README-original.md#controls) in the README. In short: Enter, Space, a click or gamepad Start/Cross skips a
 movie; Esc asks before quitting; Alt+F4, the close button or holding gamepad Back+Start quits. The game saves only at
 its own save points.
 
@@ -107,5 +107,5 @@ unencrypted ones: turn off PPSSPP's save encryption (with PPSSPP closed, set `En
 
 ## Reporting a bug
 
-See [Reporting a bug](../README.md#reporting-a-bug): attach the log and input files listed above, never game files,
+See [Reporting a bug](../README-original.md#reporting-a-bug): attach the log and input files listed above, never game files,
 saves or screenshots of the game.

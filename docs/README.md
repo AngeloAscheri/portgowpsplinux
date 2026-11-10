@@ -1,6 +1,6 @@
 # Documentation
 
-Most players only need the [README](../README.md) and the [troubleshooting and FAQ](troubleshooting.md) page. The rest
+Most players only need the [README](../README-original.md) and the [troubleshooting and FAQ](troubleshooting.md) page. The rest
 documents how the ports were made, phase by phase. Pages marked (Hebrew) are the original development notes.
 
 ## For players
